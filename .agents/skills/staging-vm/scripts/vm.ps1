@@ -21,7 +21,13 @@ if (-not (Test-Path $VBox)) {
 }
 
 function Get-VmState {
-    $line = (& $VBox showvminfo $VmName --machinereadable 2>$null | Select-String '^VMState=').Line
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $line = (& $VBox showvminfo $VmName --machinereadable 2>$null | Select-String '^VMState=').Line
+    } finally {
+        $ErrorActionPreference = $prev
+    }
     if (-not $line) { return "missing" }
     if ($line -match 'VMState="([^"]+)"') { return $Matches[1] }
     return "unknown"
@@ -31,8 +37,15 @@ function Wait-SshReady {
     param([int]$TimeoutSeconds = 90)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        $out = ssh -o BatchMode=yes -o ConnectTimeout=5 $SshHost "echo SSH_OK" 2>&1
-        if ($LASTEXITCODE -eq 0 -and ($out -match "SSH_OK")) {
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $out = ssh -o BatchMode=yes -o ConnectTimeout=5 $SshHost "echo SSH_OK" 2>&1
+            $rc = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prev
+        }
+        if ($rc -eq 0 -and ($out -match "SSH_OK")) {
             return $true
         }
         Start-Sleep -Seconds 3
@@ -48,7 +61,13 @@ function Stop-VmCleanly {
     }
     if ($state -eq "running") {
         Write-Host "Sending clean sudo poweroff to $SshHost..."
-        ssh -o BatchMode=yes -o ConnectTimeout=5 $SshHost "sudo poweroff" 2>$null | Out-Null
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            ssh -o BatchMode=yes -o ConnectTimeout=5 $SshHost "sudo poweroff" 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $prev
+        }
         for ($i = 0; $i -lt 30; $i++) {
             if ((Get-VmState) -eq "poweroff") {
                 Write-Host "$VmName powered off cleanly."
@@ -57,7 +76,13 @@ function Stop-VmCleanly {
             Start-Sleep -Seconds 2
         }
         Write-Host "Clean shutdown timed out; sending ACPI power button..."
-        & $VBox controlvm $VmName acpipowerbutton 2>$null | Out-Null
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $VBox controlvm $VmName acpipowerbutton 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $prev
+        }
         Start-Sleep -Seconds 10
     }
     if ((Get-VmState) -ne "poweroff") {

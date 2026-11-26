@@ -2,22 +2,22 @@
 # Copyright (c) 2026 zyecheng
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Main daemon: Telegram long-polling bridge + localhost Hook/Watcher IPC server."""
+"""Main daemon: Telegram long-polling bridge + authenticated localhost IPC server."""
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import signal
 import sys
 import threading
-import time
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .agy_runner import AgyRunner
-from .config import BridgeConfig
+from .config import BridgeConfig, ensure_ipc_token
 from .db import BridgeStore
 from .router import BridgeRouter
 from .telegram_client import TelegramClient
@@ -28,8 +28,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("agy-bridge.main")
 
+MAX_IPC_BODY_BYTES = 1_048_576  # 1 MiB
 
-def start_ipc_server(config: BridgeConfig, router: BridgeRouter) -> ThreadingHTTPServer:
+
+def start_ipc_server(
+    config: BridgeConfig, router: BridgeRouter, ipc_token: str
+) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
             log.debug("IPC " + fmt, *args)
@@ -41,6 +45,10 @@ def start_ipc_server(config: BridgeConfig, router: BridgeRouter) -> ThreadingHTT
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+
+        def _is_authenticated(self) -> bool:
+            presented = self.headers.get("X-Bridge-Token", "")
+            return bool(presented) and hmac.compare_digest(presented, ipc_token)
 
         def do_GET(self) -> None:
             if self.path == "/health":
@@ -57,12 +65,32 @@ def start_ipc_server(config: BridgeConfig, router: BridgeRouter) -> ThreadingHTT
             self._send_json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length") or "0")
+            if not self._is_authenticated():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                self._send_json(415, {"error": "expected_application_json"})
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._send_json(400, {"error": "invalid_content_length"})
+                return
+            if length < 0 or length > MAX_IPC_BODY_BYTES:
+                self._send_json(413, {"error": "payload_too_large"})
+                return
+
             raw = self.rfile.read(length) if length > 0 else b"{}"
             try:
                 payload = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 self._send_json(400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "expected_json_object"})
                 return
 
             if self.path == "/hook":
@@ -86,6 +114,7 @@ def start_ipc_server(config: BridgeConfig, router: BridgeRouter) -> ThreadingHTT
 def main() -> int:
     env_file = Path(__file__).resolve().parent.parent / ".env"
     config = BridgeConfig.from_env(env_file)
+    ipc_token = ensure_ipc_token(config.ipc_token_path)
     store = BridgeStore(config.db_path)
     runner = AgyRunner(config)
     telegram = TelegramClient(
@@ -93,7 +122,7 @@ def main() -> int:
         max_inline_chars=config.max_inline_chars,
     )
     router = BridgeRouter(config, store, runner, telegram)
-    ipc = start_ipc_server(config, router)
+    ipc = start_ipc_server(config, router, ipc_token)
 
     stop_event = threading.Event()
 
@@ -143,6 +172,8 @@ def main() -> int:
                 stop_event.wait(5.0)
     finally:
         ipc.shutdown()
+        ipc.server_close()
+        router.shutdown(timeout_seconds=35.0)
         store.close()
     return 0
 

@@ -1,17 +1,26 @@
 # Copyright (c) 2026 zyecheng
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Unit and integration tests for SQLite router, transcript parser, .md upload, and SSH mirroring."""
+"""Unit and integration tests for SQLite router, security boundaries, IPC, SSH sync, and recovery."""
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
+from unittest import mock
 
-from server.agy_runner import AgyResult
-from server.config import BridgeConfig
+from server.agy_runner import AgyResult, AgyRunner, build_scrubbed_env, format_channel_envelope
+from server.alpha_ssh import select_binding
+from server.bot import start_ipc_server
+from server.config import BridgeConfig, ensure_ipc_token
 from server.db import BridgeStore
 from server.router import BridgeRouter, InboundMessage
 from server.telegram_client import TelegramClient, build_two_line_preview
@@ -23,8 +32,11 @@ from server.transcript import (
 
 
 class FakeTelegram(TelegramClient):
-    def __init__(self, max_inline_chars: int = 3500) -> None:
-        super().__init__(token="", max_inline_chars=max_inline_chars)
+    def __init__(self, max_inline_chars: int = 3500, *, configured_override: bool = False) -> None:
+        super().__init__(
+            token="12345:fake" if configured_override else "",
+            max_inline_chars=max_inline_chars,
+        )
         self.sent_messages: list[dict] = []
         self.sent_documents: list[dict] = []
 
@@ -73,9 +85,23 @@ class FakeRunner:
         self.on_call = on_call
         self.calls: list[dict] = []
 
-    def run_prompt(self, prompt: str, *, conversation_id=None, workspace_dir=None, **kwargs) -> AgyResult:
+    def run_prompt(
+        self,
+        prompt: str,
+        *,
+        conversation_id=None,
+        workspace_dir=None,
+        timeout_seconds=None,
+    ) -> AgyResult:
         idx = len(self.calls)
-        self.calls.append({"prompt": prompt, "conversation_id": conversation_id, "cwd": workspace_dir})
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "conversation_id": conversation_id,
+                "cwd": workspace_dir,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
         if self.on_call is not None:
             self.on_call(idx)
         return self.responses.pop(0)
@@ -108,7 +134,8 @@ class BridgeTestCase(unittest.TestCase):
             db_path=self.root / "bridge.db",
             ipc_host="127.0.0.1",
             ipc_port=0,
-            timezone_label="PST",
+            ipc_token_path=self.root / "ipc.token",
+            timezone_name="America/Los_Angeles",
         )
         self.store = BridgeStore(self.cfg.db_path)
         self.tg = FakeTelegram(max_inline_chars=3500)
@@ -146,7 +173,6 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(dm.agy_conversation_id, "conv-dm-1")
         self.assertEqual(topic.agy_conversation_id, "conv-topic-42")
         self.assertEqual(topic.topic_name, "Networking")
-        # Third call resumed conv-topic-42
         self.assertEqual(runner.calls[2]["conversation_id"], "conv-topic-42")
 
     def test_long_reply_uploads_markdown_with_two_line_preview(self) -> None:
@@ -164,7 +190,7 @@ class BridgeTestCase(unittest.TestCase):
         self.assertIn("First summary line.\nSecond detail line.", doc["caption"])
         self.assertIn("Full reply attached as .md", doc["caption"])
 
-    def test_ssh_stop_hook_mirrors_full_silently_and_dedups(self) -> None:
+    def test_ssh_stop_hook_mirrors_full_silently_and_honors_fully_idle(self) -> None:
         conv_id = "conv-sync-1"
         b = self.store.get_or_create_binding("telegram", "111", 0, "private", str(self.workspace))
         self.store.set_conversation_id(b.id, conv_id)
@@ -182,8 +208,19 @@ class BridgeTestCase(unittest.TestCase):
         )
 
         router = BridgeRouter(self.cfg, self.store, FakeRunner([]), self.tg)  # type: ignore[arg-type]
+
+        # Non-idle Stop must be ignored
+        res_not_idle = router.handle_hook_event(
+            {"event": "Stop", "origin": "ssh", "conversationId": conv_id, "transcriptPath": str(tpath), "fullyIdle": False},
+            sync_mirror=True,
+        )
+        self.assertEqual(res_not_idle["reason"], "not_fully_idle")
+        self.assertEqual(len(self.tg.sent_messages), 0)
+
+        # Idle Stop mirrors cleanly
         res = router.handle_hook_event(
-            {"event": "Stop", "origin": "ssh", "conversationId": conv_id, "transcriptPath": str(tpath)}
+            {"event": "Stop", "origin": "ssh", "conversationId": conv_id, "transcriptPath": str(tpath), "fullyIdle": True},
+            sync_mirror=True,
         )
         self.assertEqual(res["mirrored_messages"], 2)
         self.assertEqual(self.tg.sent_messages[0]["text"], "[SSH] Check disk space over SSH")
@@ -191,14 +228,62 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(self.tg.sent_messages[1]["text"], "Root disk is at 26%.")
         self.assertTrue(self.tg.sent_messages[1]["silent"])
 
-        # Re-firing Stop hook should mirror 0 new messages (watermark advanced)
+        # Re-firing Stop mirrors 0 new messages
         res2 = router.handle_hook_event(
-            {"event": "Stop", "origin": "ssh", "conversationId": conv_id, "transcriptPath": str(tpath)}
+            {"event": "Stop", "origin": "ssh", "conversationId": conv_id, "transcriptPath": str(tpath), "fullyIdle": True},
+            sync_mirror=True,
         )
         self.assertEqual(res2["mirrored_messages"], 0)
 
-    def test_transcript_prefers_full_file_and_extracts_user_request(self) -> None:
-        conv_id = "conv-full"
+    def test_queued_telegram_turn_does_not_drop_ssh_mirror(self) -> None:
+        conv_id = "conv-race-1"
+        b = self.store.get_or_create_binding("telegram", "111", 0, "private", str(self.workspace))
+        self.store.set_conversation_id(b.id, conv_id)
+        self.store.update_watermark(b.id, 1)
+        base_steps = [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "<USER_REQUEST>\nhi\n</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "hi"},
+        ]
+        self._write_transcript(conv_id, base_steps)
+
+        runner = FakeRunner([AgyResult(conversation_id=conv_id, status="SUCCESS", response="TG reply after SSH")])
+        router = BridgeRouter(self.cfg, self.store, runner, self.tg)  # type: ignore[arg-type]
+
+        # Simulate SSH turn in flight
+        self.assertEqual(
+            router.handle_hook_event({"event": "PreInvocation", "origin": "ssh", "conversationId": conv_id})["status"],
+            "marked_busy",
+        )
+
+        # Start Telegram turn while SSH is busy
+        tg_thread = threading.Thread(
+            target=router._process_batch,
+            args=([InboundMessage("telegram", "111", 0, "private", 111, "u", "5", "from tg")],),
+        )
+        tg_thread.start()
+        time.sleep(0.15)
+
+        # SSH finishes and writes steps 2 & 3, then fires Stop
+        self._write_transcript(
+            conv_id,
+            base_steps
+            + [
+                {"step_index": 2, "type": "USER_INPUT", "status": "DONE", "content": "<USER_REQUEST>\nssh prompt\n</USER_REQUEST>"},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "ssh reply"},
+            ],
+        )
+        router.handle_hook_event({"event": "Stop", "origin": "ssh", "conversationId": conv_id, "fullyIdle": True})
+        tg_thread.join(timeout=5.0)
+        router.shutdown(timeout_seconds=5.0)
+
+        texts = [m["text"] for m in self.tg.sent_messages]
+        self.assertIn("[SSH] ssh prompt", texts)
+        self.assertIn("ssh reply", texts)
+        self.assertIn("TG reply after SSH", texts)
+        self.assertLess(texts.index("ssh reply"), texts.index("TG reply after SSH"))
+
+    def test_transcript_containment_blocks_path_traversal(self) -> None:
+        conv_id = "conv-safe-1"
         t_compact = self._write_transcript(
             conv_id,
             [{"step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "truncated"}],
@@ -209,17 +294,128 @@ class BridgeTestCase(unittest.TestCase):
             [{"step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "complete text"}],
             full=True,
         )
-        resolved = resolve_transcript_file(transcript_path=t_compact)
+        # Attacker-supplied file outside brain_dir must be ignored
+        rogue = self.root / "rogue.jsonl"
+        rogue.write_text(json.dumps({"step_index": 999, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "spoofed"}) + "\n", encoding="utf-8")
+
+        resolved = resolve_transcript_file(
+            transcript_path=rogue, brain_dir=self.brain, conversation_id=conv_id
+        )
         self.assertIsNotNone(resolved)
         self.assertEqual(resolved.name, "transcript_full.jsonl")
-        steps = read_steps_after(resolved, -1)
-        self.assertEqual(steps[0].text, "complete text")
+        self.assertEqual(read_steps_after(resolved, -1)[0].text, "complete text")
+
+        # Traversal in conversation_id itself must return None
+        self.assertIsNone(resolve_transcript_file(brain_dir=self.brain, conversation_id="../../etc"))
         self.assertEqual(
             extract_user_request_text("<USER_REQUEST>\nhello world\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>"),
             "hello world",
         )
-        preview = build_two_line_preview("Line 1\n\nLine 2\nLine 3\n" + "a" * 4000)
-        self.assertTrue(preview.startswith("Line 1\nLine 2"))
+        self.assertTrue(build_two_line_preview("Line 1\n\nLine 2\nLine 3\n" + "a" * 4000).startswith("Line 1\nLine 2"))
+
+    def test_auth_fails_closed_when_only_chat_ids_set_and_rejects_bots(self) -> None:
+        live_tg = FakeTelegram(configured_override=True)
+        cfg_chat_only = BridgeConfig(
+            **{**self.cfg.__dict__, "allowed_user_ids": frozenset(), "allowed_chat_ids": frozenset({-100999})}
+        )
+        router = BridgeRouter(cfg_chat_only, self.store, FakeRunner([]), live_tg)  # type: ignore[arg-type]
+        self.assertFalse(router.is_authorized_telegram(user_id=222, chat_id=-100999))
+
+        router_ok = BridgeRouter(self.cfg, self.store, FakeRunner([]), live_tg)  # type: ignore[arg-type]
+        self.assertTrue(router_ok.is_authorized_telegram(user_id=111, chat_id=111, is_bot=False))
+        self.assertFalse(router_ok.is_authorized_telegram(user_id=111, chat_id=111, is_bot=True))
+
+    def test_debounce_coalesces_messages_and_reset_cancels_pending(self) -> None:
+        cfg_db = BridgeConfig(**{**self.cfg.__dict__, "debounce_seconds": 0.12})
+        runner = FakeRunner([AgyResult(conversation_id="conv-deb", status="SUCCESS", response="Batched ok")])
+        router = BridgeRouter(cfg_db, self.store, runner, self.tg)  # type: ignore[arg-type]
+
+        router.enqueue_inbound(InboundMessage("telegram", "111", 0, "private", 111, "u", "1", "part one"))
+        time.sleep(0.04)
+        router.enqueue_inbound(InboundMessage("telegram", "111", 0, "private", 111, "u", "2", "part two"))
+        time.sleep(0.25)
+        router.shutdown(timeout_seconds=3.0)
+
+        self.assertEqual(len(runner.calls), 1)
+        self.assertIn("part one\n\npart two", runner.calls[0]["prompt"])
+
+    def test_ipc_requires_token_and_validates_content_type_and_json_object(self) -> None:
+        token = ensure_ipc_token(self.cfg.ipc_token_path)
+        router = BridgeRouter(self.cfg, self.store, FakeRunner([]), self.tg)  # type: ignore[arg-type]
+        srv = start_ipc_server(self.cfg, router, token)
+        port = srv.server_address[1]
+        base_url = f"http://127.0.0.1:{port}"
+        try:
+            # Missing token -> 401
+            req = urllib.request.Request(f"{base_url}/hook", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=3)
+            self.assertEqual(ctx.exception.code, 401)
+
+            # Wrong Content-Type (CSRF simple POST) -> 415
+            req = urllib.request.Request(
+                f"{base_url}/hook",
+                data=b"{}",
+                headers={"Content-Type": "text/plain", "X-Bridge-Token": token},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=3)
+            self.assertEqual(ctx.exception.code, 415)
+
+            # Non-dict JSON -> 400
+            req = urllib.request.Request(
+                f"{base_url}/hook",
+                data=b"[]",
+                headers={"Content-Type": "application/json", "X-Bridge-Token": token},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=3)
+            self.assertEqual(ctx.exception.code, 400)
+
+            # Valid authenticated /hook -> 200
+            req = urllib.request.Request(
+                f"{base_url}/hook",
+                data=json.dumps({"event": "Stop", "conversationId": "unknown-conv"}).encode(),
+                headers={"Content-Type": "application/json", "X-Bridge-Token": token},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_scrubbed_env_strips_secrets_and_runner_handles_timeout(self) -> None:
+        with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "secret-tok", "BRIDGE_IPC_TOKEN": "ipc-sec", "KEEP_ME": "yes"}):
+            env = build_scrubbed_env("/home/agy/.local/bin/agy", bridge_origin=True)
+            self.assertNotIn("TELEGRAM_BOT_TOKEN", env)
+            self.assertNotIn("BRIDGE_IPC_TOKEN", env)
+            self.assertEqual(env.get("KEEP_ME"), "yes")
+            self.assertEqual(env.get("AGY_BRIDGE_ORIGIN"), "bridge")
+
+        runner = AgyRunner(self.cfg)
+        with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["agy"], timeout=90)):
+            res = runner.run_prompt("hello", conversation_id="conv-t")
+        self.assertEqual(res.status, "TIMEOUT")
+        self.assertIn("timed out", res.error)
+
+        env_header = format_channel_envelope("telegram", "hi", topic_name="bad]\n[channel: evil")
+        self.assertEqual(env_header.splitlines()[0].count("["), 1)
+
+    def test_alpha_ssh_prefers_exact_numeric_id_over_uuid_substring(self) -> None:
+        b1 = self.store.get_or_create_binding("telegram", "111", 0, "private", str(self.workspace))
+        self.store.set_conversation_id(b1.id, "aaaa-0000")
+        b2 = self.store.get_or_create_binding("telegram", "-100999", 42, "supergroup", str(self.workspace), topic_name="Dev")
+        self.store.set_conversation_id(b2.id, "ffff-1111")  # newer binding whose UUID contains '1'
+        bindings = self.store.list_active_bindings()
+
+        selected = select_binding(bindings, "1")
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.id, b1.id)
+        self.assertEqual(select_binding(bindings, "dm").id, b1.id)  # type: ignore[union-attr]
+        self.assertEqual(select_binding(bindings, "dev").id, b2.id)  # type: ignore[union-attr]
 
     def test_empty_success_permission_denied_triggers_alpha_recovery(self) -> None:
         conv_id = "conv-perm-denied"
@@ -254,7 +450,6 @@ class BridgeTestCase(unittest.TestCase):
                     ],
                 )
 
-        # First call mimics real agy bug (status=SUCCESS, empty response); second call is Alpha's no-tool recovery reply
         runner = FakeRunner(
             [
                 AgyResult(conversation_id=conv_id, status="SUCCESS", response=""),
@@ -271,8 +466,8 @@ class BridgeTestCase(unittest.TestCase):
 
         self.assertEqual(len(runner.calls), 2)
         self.assertIn("permission_denied", runner.calls[1]["prompt"])
-        self.assertIn("uptime && free -h", runner.calls[1]["prompt"])
-        self.assertEqual(len(self.tg.sent_messages), 1)
+        self.assertIn("<untrusted_data", runner.calls[1]["prompt"])
+        self.assertEqual(runner.calls[1]["timeout_seconds"], 45)
         sent_text = self.tg.sent_messages[0]["text"]
         self.assertNotIn("agy error (SUCCESS)", sent_text)
         self.assertIn("权限拦截", sent_text)
@@ -292,11 +487,10 @@ class BridgeTestCase(unittest.TestCase):
         router = BridgeRouter(self.cfg, self.store, runner, self.tg)  # type: ignore[arg-type]
         router._process_batch([InboundMessage("telegram", "111", 0, "private", 111, "u", "21", "hello")])
 
-        # Must NOT call agy a second time on auth failure
         self.assertEqual(len(runner.calls), 1)
         sent_text = self.tg.sent_messages[0]["text"]
         self.assertIn("auth_required", sent_text)
-        self.assertIn("ssh agy-staging", sent_text)
+        self.assertIn("re-authenticate", sent_text)
 
     def test_failed_recovery_falls_back_to_deterministic_report(self) -> None:
         conv_id = "conv-rec-fail"

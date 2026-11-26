@@ -1,7 +1,7 @@
 # Copyright (c) 2026 zyecheng
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Core channel-agnostic router, debouncer, and SSH transcript mirror."""
+"""Core router, debouncer, failure recovery, and SSH transcript mirror."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .agy_runner import AgyRunner, format_channel_envelope
-from .config import BridgeConfig
-from .db import VALID_MIRROR_MODES, Binding, BridgeStore
+from .agy_runner import AgyResult, AgyRunner, format_channel_envelope
+from .config import VALID_MIRROR_MODES, BridgeConfig
+from .db import Binding, BridgeStore
 from .failure_analyzer import (
     analyze_turn_failure,
     build_recovery_prompt,
@@ -24,6 +24,7 @@ from .failure_analyzer import (
 from .telegram_client import TelegramClient
 from .transcript import (
     get_latest_step_index,
+    is_safe_conversation_id,
     read_steps_after,
     resolve_transcript_file,
     strip_bridge_header,
@@ -32,6 +33,7 @@ from .transcript import (
 log = logging.getLogger("agy-bridge.router")
 
 SSH_BUSY_TTL_SECONDS = 300.0
+RECOVERY_TIMEOUT_SECONDS = 45
 
 
 @dataclass
@@ -61,38 +63,97 @@ class BridgeRouter:
         self.runner = runner
         self.telegram = telegram
 
-        # Per-binding lock serializes turns on the same conversation
-        self._binding_locks_guard = threading.Lock()
-        self._binding_locks: dict[int, threading.Lock] = {}
+        # Locks keyed by normalized endpoint (channel, chat_id, thread_id) so
+        # /reset cannot split two threads across different lock objects.
+        self._endpoint_locks_guard = threading.Lock()
+        self._endpoint_locks: dict[tuple[str, str, int], threading.Lock] = {}
 
         # Track active bridge runs and external SSH runs per agy conversation_id
         self._state_guard = threading.Lock()
         self._bridge_in_flight: set[str] = set()
         self._ssh_busy_until: dict[str, float] = {}
 
-        # Debounce buffers keyed by (channel, chat_id, thread_id)
+        # Debounce buffers keyed by (channel, chat_id, thread_id) with generation IDs
         self._debounce_guard = threading.Lock()
         self._pending_batches: dict[tuple[str, str, int], list[InboundMessage]] = {}
-        self._debounce_timers: dict[tuple[str, str, int], threading.Timer] = {}
+        self._debounce_timers: dict[tuple[str, str, int], tuple[int, threading.Timer]] = {}
+        self._debounce_seq = 0
 
-    def _get_binding_lock(self, binding_id: int) -> threading.Lock:
-        with self._binding_locks_guard:
-            lock = self._binding_locks.get(binding_id)
+        # Track worker threads for graceful shutdown draining
+        self._workers_guard = threading.Lock()
+        self._workers: set[threading.Thread] = set()
+        self._shutting_down = threading.Event()
+
+    def _get_endpoint_lock(
+        self, channel: str, chat_id: str, thread_id: int
+    ) -> threading.Lock:
+        key = (channel, str(chat_id), int(thread_id))
+        with self._endpoint_locks_guard:
+            lock = self._endpoint_locks.get(key)
             if lock is None:
                 lock = threading.Lock()
-                self._binding_locks[binding_id] = lock
+                self._endpoint_locks[key] = lock
             return lock
 
-    def is_authorized_telegram(self, user_id: int | None, chat_id: int | None) -> bool:
-        if self.config.allowed_user_ids:
-            if user_id is None or user_id not in self.config.allowed_user_ids:
-                return False
+    def _spawn_worker(self, target, args: tuple = ()) -> threading.Thread:
+        def _wrapped() -> None:
+            try:
+                target(*args)
+            except Exception:
+                log.exception("Unhandled error in bridge worker thread")
+            finally:
+                with self._workers_guard:
+                    self._workers.discard(threading.current_thread())
+
+        t = threading.Thread(target=_wrapped, daemon=False)
+        with self._workers_guard:
+            self._workers.add(t)
+        t.start()
+        return t
+
+    def shutdown(self, timeout_seconds: float = 35.0) -> None:
+        """Cancel pending timers, flush queued debounce batches, and join active workers."""
+        self._shutting_down.set()
+        pending_to_flush: list[list[InboundMessage]] = []
+        with self._debounce_guard:
+            for _gen, timer in self._debounce_timers.values():
+                timer.cancel()
+            self._debounce_timers.clear()
+            for batch in self._pending_batches.values():
+                if batch:
+                    pending_to_flush.append(batch)
+            self._pending_batches.clear()
+
+        for batch in pending_to_flush:
+            self._spawn_worker(self._process_batch, (batch,))
+
+        deadline = time.time() + timeout_seconds
+        while True:
+            with self._workers_guard:
+                alive = [t for t in self._workers if t.is_alive()]
+            if not alive or time.time() >= deadline:
+                break
+            for t in alive:
+                rem = max(0.05, deadline - time.time())
+                t.join(timeout=min(rem, 1.0))
+
+    def is_authorized_telegram(
+        self,
+        user_id: int | None,
+        chat_id: int | None,
+        *,
+        is_bot: bool = False,
+    ) -> bool:
+        if is_bot:
+            return False
+        if not self.config.allowed_user_ids:
+            # Always fail closed in live mode when TELEGRAM_ALLOWED_USER_IDS is unset
+            return not self.telegram.configured
+        if user_id is None or user_id not in self.config.allowed_user_ids:
+            return False
         if self.config.allowed_chat_ids:
             if chat_id is None or chat_id not in self.config.allowed_chat_ids:
                 return False
-        # Fail closed if neither allowlist is set when running against live Telegram
-        if not self.config.allowed_user_ids and not self.config.allowed_chat_ids:
-            return not self.telegram.configured
         return True
 
     def handle_telegram_update(self, update: dict) -> None:
@@ -112,20 +173,21 @@ class BridgeRouter:
         if chat_type == "private":
             thread_id = 0
         else:
-            # General topic may omit message_thread_id or send 1
             thread_id = int(raw_thread_id) if raw_thread_id else 1
 
-        # Capture topic creation metadata if present
-        topic_created = msg.get("forum_topic_created")
-        if isinstance(topic_created, dict) and topic_created.get("name"):
-            if self.is_authorized_telegram(user_id, chat_id):
+        is_bot = bool(sender.get("is_bot", False))
+
+        # Capture topic creation / rename metadata
+        topic_event = msg.get("forum_topic_created") or msg.get("forum_topic_edited")
+        if isinstance(topic_event, dict) and topic_event.get("name"):
+            if self.is_authorized_telegram(user_id, chat_id, is_bot=is_bot):
                 self.store.get_or_create_binding(
                     channel="telegram",
                     chat_id=str(chat_id),
                     thread_id=thread_id,
                     chat_type=chat_type,
                     workspace_dir=str(self.config.alpha_workspace),
-                    topic_name=str(topic_created["name"]),
+                    topic_name=str(topic_event["name"]),
                     default_mirror_mode=self.config.default_mirror_mode,
                 )
             return
@@ -134,13 +196,13 @@ class BridgeRouter:
         if not text:
             return
 
-        # Allow /id even before allowlists are filled? No — log IDs on server instead for security.
-        if not self.is_authorized_telegram(user_id, chat_id):
+        if not self.is_authorized_telegram(user_id, chat_id, is_bot=is_bot):
             log.warning(
-                "Ignored unauthorized Telegram message (user_id=%s chat_id=%s thread_id=%s)",
+                "Ignored unauthorized Telegram message (user_id=%s chat_id=%s thread_id=%s is_bot=%s)",
                 user_id,
                 chat_id,
                 thread_id,
+                is_bot,
             )
             return
 
@@ -163,11 +225,8 @@ class BridgeRouter:
             topic_name=topic_name,
         )
 
-        # Commands execute immediately without debounce
         if text.startswith("/"):
-            threading.Thread(
-                target=self._handle_command, args=(inbound,), daemon=True
-            ).start()
+            self._spawn_worker(self._handle_command, (inbound,))
             return
 
         self.enqueue_inbound(inbound)
@@ -176,75 +235,126 @@ class BridgeRouter:
         key = (msg.channel, msg.chat_id, msg.thread_id)
         delay = max(0.0, self.config.debounce_seconds)
         if delay == 0.0:
-            threading.Thread(
-                target=self._process_batch, args=([msg],), daemon=True
-            ).start()
+            self._spawn_worker(self._process_batch, ([msg],))
             return
 
         with self._debounce_guard:
             self._pending_batches.setdefault(key, []).append(msg)
-            old_timer = self._debounce_timers.pop(key, None)
-            if old_timer is not None:
-                old_timer.cancel()
-            timer = threading.Timer(delay, self._flush_batch, args=(key,))
+            prev = self._debounce_timers.pop(key, None)
+            if prev is not None:
+                prev[1].cancel()
+            self._debounce_seq += 1
+            gen = self._debounce_seq
+            timer = threading.Timer(delay, self._flush_batch, args=(key, gen))
             timer.daemon = True
-            self._debounce_timers[key] = timer
+            self._debounce_timers[key] = (gen, timer)
             timer.start()
 
-    def _flush_batch(self, key: tuple[str, str, int]) -> None:
+    def _cancel_pending_debounce(self, key: tuple[str, str, int]) -> None:
         with self._debounce_guard:
-            batch = self._pending_batches.pop(key, [])
-            self._debounce_timers.pop(key, None)
-        if batch:
-            self._process_batch(batch)
+            prev = self._debounce_timers.pop(key, None)
+            if prev is not None:
+                prev[1].cancel()
+            self._pending_batches.pop(key, None)
 
-    def _wait_if_ssh_busy(self, conv_id: str | None, chat_id: str, thread_id: int) -> None:
+    def _flush_batch(self, key: tuple[str, str, int], expected_gen: int) -> None:
+        with self._debounce_guard:
+            entry = self._debounce_timers.get(key)
+            if entry is None or entry[0] != expected_gen:
+                return
+            self._debounce_timers.pop(key, None)
+            batch = self._pending_batches.pop(key, [])
+        if batch:
+            self._spawn_worker(self._process_batch, (batch,))
+
+    def _wait_if_ssh_busy(
+        self, conv_id: str | None, chat_id: str, thread_id: int, *, notify: bool = True
+    ) -> None:
+        """Wait OUTSIDE the endpoint lock so the Stop hook can mirror cleanly."""
         if not conv_id:
             return
         notified = False
-        while True:
+        while not self._shutting_down.is_set():
             with self._state_guard:
                 until = self._ssh_busy_until.get(conv_id, 0.0)
                 if time.time() >= until:
                     self._ssh_busy_until.pop(conv_id, None)
                     return
-            if not notified:
+            if notify and not notified:
                 notified = True
-                self.telegram.send_message(
-                    chat_id,
-                    "Queued — active SSH session on this conversation. Will run as soon as it finishes.",
-                    thread_id=thread_id,
-                    disable_notification=True,
-                )
-            time.sleep(1.5)
+                try:
+                    self.telegram.send_message(
+                        chat_id,
+                        "Queued — active SSH session on this conversation. Will run as soon as it finishes.",
+                        thread_id=thread_id,
+                        disable_notification=True,
+                    )
+                except Exception:
+                    log.exception("Failed sending queued notification")
+            time.sleep(1.0)
+
+    def _run_tracked_prompt(
+        self,
+        prompt: str,
+        *,
+        conv_id: str | None,
+        workspace_dir: Path,
+        timeout_seconds: int | None = None,
+    ) -> AgyResult:
+        if conv_id:
+            with self._state_guard:
+                self._bridge_in_flight.add(conv_id)
+        try:
+            return self.runner.run_prompt(
+                prompt,
+                conversation_id=conv_id,
+                workspace_dir=workspace_dir,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            if conv_id:
+                with self._state_guard:
+                    self._bridge_in_flight.discard(conv_id)
+
+    def _reconcile_external_steps_locked(self, binding: Binding) -> None:
+        """Mirror any un-mirrored SSH/offline turns before running a new bridge turn."""
+        if binding.agy_conversation_id:
+            self._mirror_binding_locked(binding, transcript_path=None)
 
     def _process_batch(self, batch: list[InboundMessage]) -> None:
         first = batch[0]
         topic_name = next((m.topic_name for m in batch if m.topic_name), "")
-        binding = self.store.get_or_create_binding(
-            channel=first.channel,
-            chat_id=first.chat_id,
-            thread_id=first.thread_id,
-            chat_type=first.chat_type,
-            workspace_dir=str(self.config.alpha_workspace),
-            topic_name=topic_name,
-            default_mirror_mode=self.config.default_mirror_mode,
-        )
         combined_text = "\n\n".join(m.text for m in batch)
         attachments = [a for m in batch for a in m.attachments]
 
-        lock = self._get_binding_lock(binding.id)
+        # Wait for active SSH session OUTSIDE endpoint lock so Stop hook is never blocked
+        pre_binding = self.store.get_active_binding(
+            first.channel, first.chat_id, first.thread_id
+        )
+        if pre_binding and pre_binding.agy_conversation_id:
+            self._wait_if_ssh_busy(
+                pre_binding.agy_conversation_id, first.chat_id, first.thread_id
+            )
+
+        lock = self._get_endpoint_lock(first.channel, first.chat_id, first.thread_id)
         with lock:
-            # Refresh binding state inside lock
-            current = self.store.get_active_binding(
+            binding = self.store.get_or_create_binding(
+                channel=first.channel,
+                chat_id=first.chat_id,
+                thread_id=first.thread_id,
+                chat_type=first.chat_type,
+                workspace_dir=str(self.config.alpha_workspace),
+                topic_name=topic_name,
+                default_mirror_mode=self.config.default_mirror_mode,
+            )
+            # Reconcile any SSH turns that finished before we acquired the lock
+            self._reconcile_external_steps_locked(binding)
+            refreshed = self.store.get_active_binding(
                 binding.channel, binding.chat_id, binding.thread_id
             )
-            if current is None:
+            if refreshed is None:
                 return
-            binding = current
-            self._wait_if_ssh_busy(
-                binding.agy_conversation_id, binding.chat_id, binding.thread_id
-            )
+            binding = refreshed
 
             self.store.log_message(
                 binding.id,
@@ -259,90 +369,92 @@ class BridgeRouter:
                 text=combined_text,
                 topic_name=binding.topic_name,
                 attachments=attachments or None,
-                tz_label=self.config.timezone_label,
+                timezone_name=self.config.timezone_name,
+            )
+            self._execute_and_deliver_locked(
+                binding=binding,
+                envelope=envelope,
+                raw_user_text=combined_text,
+                origin="bridge",
+                show_typing=True,
             )
 
-            stop_typing = threading.Event()
-            typing_thread = threading.Thread(
+    def _execute_and_deliver_locked(
+        self,
+        *,
+        binding: Binding,
+        envelope: str,
+        raw_user_text: str,
+        origin: str,
+        show_typing: bool,
+    ) -> None:
+        stop_typing = threading.Event()
+        if show_typing:
+            threading.Thread(
                 target=self._typing_loop,
                 args=(binding.chat_id, binding.thread_id, stop_typing),
                 daemon=True,
-            )
-            typing_thread.start()
+            ).start()
+
+        try:
+            conv_id = binding.agy_conversation_id
+            pre_turn_step = binding.last_mirrored_step
+            if conv_id:
+                tpath_before = resolve_transcript_file(
+                    brain_dir=self.config.agy_brain_dir,
+                    conversation_id=conv_id,
+                )
+                if tpath_before is not None:
+                    pre_turn_step = max(pre_turn_step, get_latest_step_index(tpath_before))
 
             try:
-                conv_id = binding.agy_conversation_id
-                pre_turn_step = binding.last_mirrored_step
-                if conv_id:
-                    tpath_before = resolve_transcript_file(
-                        brain_dir=self.config.agy_brain_dir,
-                        conversation_id=conv_id,
-                    )
-                    if tpath_before is not None:
-                        pre_turn_step = max(pre_turn_step, get_latest_step_index(tpath_before))
-                    with self._state_guard:
-                        self._bridge_in_flight.add(conv_id)
-
-                try:
-                    result = self.runner.run_prompt(
-                        envelope,
-                        conversation_id=conv_id,
-                        workspace_dir=Path(binding.workspace_dir),
-                    )
-                except Exception as exc:
-                    log.exception("agy runner crashed for binding %s", binding.id)
-                    self.telegram.send_message(
-                        binding.chat_id,
-                        f"Agent execution crashed before returning: {exc}",
-                        thread_id=binding.thread_id,
-                    )
-                    return
-                finally:
-                    if conv_id:
-                        with self._state_guard:
-                            self._bridge_in_flight.discard(conv_id)
-
-                final_conv_id = result.conversation_id or conv_id
-                if final_conv_id and final_conv_id != binding.agy_conversation_id:
-                    self.store.set_conversation_id(binding.id, final_conv_id)
-                    binding.agy_conversation_id = final_conv_id
-
-                if result.status != "SUCCESS" or not result.response:
-                    reply_text = self._recover_failed_turn(
-                        binding=binding,
-                        user_message=combined_text,
-                        result=result,
-                        conv_id=final_conv_id,
-                        pre_turn_step=pre_turn_step,
-                    )
-                    self._advance_watermark(binding.id, final_conv_id)
-                    self.telegram.send_text_or_markdown_file(
-                        binding.chat_id,
-                        reply_text,
-                        thread_id=binding.thread_id,
-                    )
-                    self.store.log_message(
-                        binding.id,
-                        direction="out",
-                        origin="bridge_recovery",
-                        content_preview=reply_text,
-                    )
-                    return
-
-                self._advance_watermark(binding.id, final_conv_id)
-                self.telegram.send_text_or_markdown_file(
-                    binding.chat_id,
-                    result.response,
-                    thread_id=binding.thread_id,
+                result = self._run_tracked_prompt(
+                    envelope,
+                    conv_id=conv_id,
+                    workspace_dir=Path(binding.workspace_dir),
                 )
-                self.store.log_message(
-                    binding.id,
-                    direction="out",
-                    origin="bridge",
-                    content_preview=result.response,
+            except Exception as exc:
+                log.exception("agy runner crashed for binding %s", binding.id)
+                result = AgyResult(
+                    conversation_id=conv_id or "",
+                    status="ERROR",
+                    response="",
+                    error=f"Runner exception: {exc}",
                 )
-            finally:
-                stop_typing.set()
+
+            final_conv_id = result.conversation_id or conv_id
+            if final_conv_id and final_conv_id != binding.agy_conversation_id:
+                self.store.set_conversation_id(binding.id, final_conv_id)
+                binding.agy_conversation_id = final_conv_id
+
+            if result.status != "SUCCESS" or not result.response:
+                reply_text = self._recover_failed_turn(
+                    binding=binding,
+                    user_message=raw_user_text,
+                    result=result,
+                    conv_id=final_conv_id,
+                    pre_turn_step=pre_turn_step,
+                )
+                delivery_origin = f"{origin}_recovery"
+            else:
+                reply_text = result.response
+                delivery_origin = origin
+
+            # Deliver BEFORE advancing watermark so transient delivery failures are not silently lost
+            self.telegram.send_text_or_markdown_file(
+                binding.chat_id,
+                reply_text,
+                thread_id=binding.thread_id,
+            )
+            self._advance_watermark(binding.id, final_conv_id)
+            self.store.log_message(
+                binding.id,
+                direction="out",
+                origin=delivery_origin,
+                content_preview=reply_text,
+            )
+        finally:
+            stop_typing.set()
 
     def _advance_watermark(self, binding_id: int, conv_id: str | None) -> None:
         if not conv_id:
@@ -361,7 +473,7 @@ class BridgeRouter:
         *,
         binding: Binding,
         user_message: str,
-        result,
+        result: AgyResult,
         conv_id: str | None,
         pre_turn_step: int,
     ) -> str:
@@ -380,18 +492,17 @@ class BridgeRouter:
             diag.attempted_tools,
         )
 
-        if diag.recoverable_via_agent:
+        # Skip Stage-2 agent recovery when there is no conversation_id yet (avoids orphan conversations)
+        if diag.recoverable_via_agent and conv_id:
             recovery_prompt = build_recovery_prompt(
-                user_message, diag, tz_label=self.config.timezone_label
+                user_message, diag, timezone_name=self.config.timezone_name
             )
-            if conv_id:
-                with self._state_guard:
-                    self._bridge_in_flight.add(conv_id)
             try:
-                rec = self.runner.run_prompt(
+                rec = self._run_tracked_prompt(
                     recovery_prompt,
-                    conversation_id=conv_id,
+                    conv_id=conv_id,
                     workspace_dir=Path(binding.workspace_dir),
+                    timeout_seconds=RECOVERY_TIMEOUT_SECONDS,
                 )
                 if rec.status == "SUCCESS" and rec.response:
                     tag = f"[{diag.category}"
@@ -401,10 +512,6 @@ class BridgeRouter:
                     return f"{rec.response}\n\n{tag}"
             except Exception:
                 log.exception("Recovery turn failed for binding=%s", binding.id)
-            finally:
-                if conv_id:
-                    with self._state_guard:
-                        self._bridge_in_flight.discard(conv_id)
 
         return format_fallback_report(diag, conversation_id=conv_id)
 
@@ -418,9 +525,8 @@ class BridgeRouter:
         cmd = parts[0].split("@")[0].lower()
         arg = parts[1].lower() if len(parts) > 1 else ""
 
-        binding = self.store.get_active_binding(msg.channel, msg.chat_id, msg.thread_id)
-
         if cmd == "/id":
+            binding = self.store.get_active_binding(msg.channel, msg.chat_id, msg.thread_id)
             reply = (
                 f"user_id: {msg.user_id}\n"
                 f"chat_id: {msg.chat_id}\n"
@@ -443,6 +549,7 @@ class BridgeRouter:
             return
 
         if cmd == "/status":
+            binding = self.store.get_active_binding(msg.channel, msg.chat_id, msg.thread_id)
             try:
                 uptime = subprocess.check_output(["uptime", "-p"], text=True).strip()
                 disk = subprocess.check_output(["df", "-h", "/"], text=True).splitlines()[-1]
@@ -461,7 +568,8 @@ class BridgeRouter:
             return
 
         if cmd == "/mirror":
-            if binding is None:
+            lock = self._get_endpoint_lock(msg.channel, msg.chat_id, msg.thread_id)
+            with lock:
                 binding = self.store.get_or_create_binding(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
@@ -471,55 +579,50 @@ class BridgeRouter:
                     topic_name=msg.topic_name,
                     default_mirror_mode=self.config.default_mirror_mode,
                 )
-            if not arg:
-                self.telegram.send_message(
-                    msg.chat_id,
-                    f"Current SSH mirror mode: {binding.mirror_mode}\nUsage: /mirror full | replies_only | muted",
-                    thread_id=msg.thread_id,
-                )
-                return
-            if arg not in VALID_MIRROR_MODES:
-                self.telegram.send_message(
-                    msg.chat_id,
-                    f"Invalid mode '{arg}'. Choose: {', '.join(VALID_MIRROR_MODES)}",
-                    thread_id=msg.thread_id,
-                )
-                return
-            self.store.set_mirror_mode(binding.id, arg)
-            self.telegram.send_message(
-                msg.chat_id,
-                f"SSH mirror mode set to: {arg}",
-                thread_id=msg.thread_id,
-            )
+                if not arg:
+                    reply = (
+                        f"Current SSH mirror mode: {binding.mirror_mode}\n"
+                        "Usage: /mirror full | replies_only | muted"
+                    )
+                elif arg not in VALID_MIRROR_MODES:
+                    reply = f"Invalid mode '{arg}'. Choose: {', '.join(VALID_MIRROR_MODES)}"
+                else:
+                    self.store.set_mirror_mode(binding.id, arg)
+                    reply = f"SSH mirror mode set to: {arg}"
+            self.telegram.send_message(msg.chat_id, reply, thread_id=msg.thread_id)
             return
 
         if cmd == "/reset":
-            if binding is not None:
-                old_id = binding.agy_conversation_id or "(none)"
-                self.store.archive_binding(binding.id)
-                self.telegram.send_message(
-                    msg.chat_id,
-                    f"Archived conversation {old_id}. Your next message starts a fresh conversation.",
-                    thread_id=msg.thread_id,
-                )
-            else:
-                self.telegram.send_message(
-                    msg.chat_id,
-                    "No active conversation on this thread yet.",
-                    thread_id=msg.thread_id,
-                )
+            key = (msg.channel, msg.chat_id, msg.thread_id)
+            self._cancel_pending_debounce(key)
+            lock = self._get_endpoint_lock(msg.channel, msg.chat_id, msg.thread_id)
+            with lock:
+                binding = self.store.get_active_binding(msg.channel, msg.chat_id, msg.thread_id)
+                if binding is not None:
+                    old_id = binding.agy_conversation_id or "(none)"
+                    self.store.archive_binding(binding.id)
+                    reply = f"Archived conversation {old_id}. Your next message starts a fresh conversation."
+                else:
+                    reply = "No active conversation on this thread yet."
+            self.telegram.send_message(msg.chat_id, reply, thread_id=msg.thread_id)
             return
 
         if cmd == "/compact":
-            if binding is None or not binding.agy_conversation_id:
-                self.telegram.send_message(
-                    msg.chat_id,
-                    "No active conversation to compact yet.",
-                    thread_id=msg.thread_id,
+            pre_binding = self.store.get_active_binding(msg.channel, msg.chat_id, msg.thread_id)
+            if pre_binding and pre_binding.agy_conversation_id:
+                self._wait_if_ssh_busy(
+                    pre_binding.agy_conversation_id, msg.chat_id, msg.thread_id
                 )
-                return
-            lock = self._get_binding_lock(binding.id)
+            lock = self._get_endpoint_lock(msg.channel, msg.chat_id, msg.thread_id)
             with lock:
+                binding = self.store.get_active_binding(msg.channel, msg.chat_id, msg.thread_id)
+                if binding is None or not binding.agy_conversation_id:
+                    self.telegram.send_message(
+                        msg.chat_id,
+                        "No active conversation to compact yet.",
+                        thread_id=msg.thread_id,
+                    )
+                    return
                 rc, out = self.runner.run_cli_slash(
                     "/compact",
                     conversation_id=binding.agy_conversation_id,
@@ -532,21 +635,19 @@ class BridgeRouter:
             )
             return
 
-        # Unknown slash command: forward to Alpha as normal text
         self.enqueue_inbound(msg)
 
     # ------------------------------------------------------------------
-    # Hook & Watcher IPC handlers (called by localhost HTTP IPC server)
+    # Hook & Watcher IPC handlers (called by authenticated localhost IPC)
     # ------------------------------------------------------------------
 
-    def handle_hook_event(self, payload: dict) -> dict:
+    def handle_hook_event(self, payload: dict, *, sync_mirror: bool = False) -> dict:
         event = str(payload.get("event") or "")
         conv_id = str(payload.get("conversationId") or "").strip()
         origin = str(payload.get("origin") or "ssh")
-        if not conv_id:
-            return {"status": "ignored", "reason": "no_conversation_id"}
+        if not conv_id or not is_safe_conversation_id(conv_id):
+            return {"status": "ignored", "reason": "invalid_conversation_id"}
 
-        # Ignore hooks fired by our own bridge subprocess
         if origin == "bridge":
             return {"status": "ignored", "reason": "bridge_origin"}
         with self._state_guard:
@@ -554,17 +655,35 @@ class BridgeRouter:
                 return {"status": "ignored", "reason": "bridge_in_flight"}
 
         if event == "PreInvocation":
+            # Only track busy state for conversations bound to an active channel
+            if self.store.get_binding_by_conversation(conv_id) is None:
+                return {"status": "ignored", "reason": "unbound_conversation"}
             with self._state_guard:
                 self._ssh_busy_until[conv_id] = time.time() + SSH_BUSY_TTL_SECONDS
             return {"status": "marked_busy"}
 
         if event == "Stop":
-            with self._state_guard:
-                self._ssh_busy_until.pop(conv_id, None)
+            if not payload.get("fullyIdle", True):
+                return {"status": "ignored", "reason": "not_fully_idle"}
             transcript_raw = str(payload.get("transcriptPath") or "").strip()
             tpath = Path(transcript_raw) if transcript_raw else None
-            mirrored = self.mirror_external_turns(conv_id, transcript_path=tpath)
-            return {"status": "synced", "mirrored_messages": mirrored}
+            if sync_mirror:
+                mirrored = self.mirror_external_turns(conv_id, transcript_path=tpath)
+                with self._state_guard:
+                    self._ssh_busy_until.pop(conv_id, None)
+                return {"status": "synced", "mirrored_messages": mirrored}
+
+            # Mirror asynchronously so Stop hook returns immediately (<50ms) without stalling SSH;
+            # keep _ssh_busy_until set until mirroring completes so queued Telegram turns don't jump ahead.
+            def _bg_mirror() -> None:
+                try:
+                    self.mirror_external_turns(conv_id, transcript_path=tpath)
+                finally:
+                    with self._state_guard:
+                        self._ssh_busy_until.pop(conv_id, None)
+
+            self._spawn_worker(_bg_mirror)
+            return {"status": "queued_mirror"}
 
         return {"status": "ignored", "reason": f"unknown_event:{event}"}
 
@@ -579,79 +698,85 @@ class BridgeRouter:
         if binding is None:
             return 0
 
-        lock = self._get_binding_lock(binding.id)
+        lock = self._get_endpoint_lock(binding.channel, binding.chat_id, binding.thread_id)
         with lock:
-            # Re-fetch watermark inside lock
-            binding = self.store.get_binding_by_conversation(conversation_id)
-            if binding is None:
+            current = self.store.get_binding_by_conversation(conversation_id)
+            if current is None:
                 return 0
+            return self._mirror_binding_locked(current, transcript_path=transcript_path)
 
-            resolved = resolve_transcript_file(
-                transcript_path=transcript_path,
-                brain_dir=self.config.agy_brain_dir,
-                conversation_id=conversation_id,
-            )
-            if resolved is None:
-                return 0
+    def _mirror_binding_locked(
+        self,
+        binding: Binding,
+        *,
+        transcript_path: Path | None,
+    ) -> int:
+        if not binding.agy_conversation_id:
+            return 0
+        resolved = resolve_transcript_file(
+            transcript_path=transcript_path,
+            brain_dir=self.config.agy_brain_dir,
+            conversation_id=binding.agy_conversation_id,
+        )
+        if resolved is None:
+            return 0
 
-            new_steps = read_steps_after(resolved, binding.last_mirrored_step)
-            if not new_steps:
-                return 0
+        new_steps = read_steps_after(resolved, binding.last_mirrored_step)
+        if not new_steps:
+            return 0
 
-            max_step = max(s.step_index for s in new_steps)
-            if binding.mirror_mode == "muted":
-                self.store.update_watermark(binding.id, max_step)
-                return 0
+        if binding.mirror_mode == "muted":
+            self.store.update_watermark(binding.id, max(s.step_index for s in new_steps))
+            return 0
 
-            sent = 0
-            # Group steps into turns: each USER_INPUT followed by its final PLANNER_RESPONSE
-            pending_user: str | None = None
-            for idx, step in enumerate(new_steps):
-                if step.step_type == "USER_INPUT":
-                    pending_user = strip_bridge_header(step.text)
-                elif step.step_type == "PLANNER_RESPONSE":
-                    # Only emit the last PLANNER_RESPONSE before the next USER_INPUT or end
-                    next_is_planner = (
-                        idx + 1 < len(new_steps)
-                        and new_steps[idx + 1].step_type == "PLANNER_RESPONSE"
-                    )
-                    if next_is_planner:
-                        continue
+        sent = 0
+        pending_user: str | None = None
+        for idx, step in enumerate(new_steps):
+            if step.step_type == "USER_INPUT":
+                pending_user = strip_bridge_header(step.text)
+            elif step.step_type == "PLANNER_RESPONSE":
+                next_is_planner = (
+                    idx + 1 < len(new_steps)
+                    and new_steps[idx + 1].step_type == "PLANNER_RESPONSE"
+                )
+                if next_is_planner:
+                    continue
 
-                    if binding.mirror_mode == "full" and pending_user:
-                        snippet = pending_user.replace("\n", " ").strip()
-                        cap = self.config.ssh_prompt_preview_chars
-                        if len(snippet) > cap:
-                            snippet = snippet[: cap - 3].rstrip() + "..."
-                        self.telegram.send_message(
-                            binding.chat_id,
-                            f"[SSH] {snippet}",
-                            thread_id=binding.thread_id,
-                            disable_notification=True,
-                        )
-                        sent += 1
-
-                    prefix = "[SSH] " if binding.mirror_mode == "replies_only" else ""
-                    self.telegram.send_text_or_markdown_file(
+                if binding.mirror_mode == "full" and pending_user:
+                    snippet = pending_user.replace("\n", " ").strip()
+                    cap = max(20, self.config.ssh_prompt_preview_chars)
+                    if len(snippet) > cap:
+                        snippet = snippet[: cap - 3].rstrip() + "..."
+                    self.telegram.send_message(
                         binding.chat_id,
-                        step.text,
+                        f"[SSH] {snippet}",
                         thread_id=binding.thread_id,
                         disable_notification=True,
-                        prefix=prefix,
-                        filename_prefix="alpha-ssh-reply",
-                    )
-                    self.store.log_message(
-                        binding.id,
-                        direction="mirror",
-                        origin="ssh",
-                        agy_step_index=step.step_index,
-                        content_preview=step.text,
                     )
                     sent += 1
-                    pending_user = None
 
-            self.store.update_watermark(binding.id, max_step)
-            return sent
+                prefix = "[SSH] " if binding.mirror_mode == "replies_only" else ""
+                self.telegram.send_text_or_markdown_file(
+                    binding.chat_id,
+                    step.text,
+                    thread_id=binding.thread_id,
+                    disable_notification=True,
+                    prefix=prefix,
+                    filename_prefix="alpha-ssh-reply",
+                )
+                # Advance watermark after each delivered turn so partial failures don't duplicate earlier turns
+                self.store.update_watermark(binding.id, step.step_index)
+                self.store.log_message(
+                    binding.id,
+                    direction="mirror",
+                    origin="ssh",
+                    agy_step_index=step.step_index,
+                    content_preview=step.text,
+                )
+                sent += 1
+                pending_user = None
+
+        return sent
 
     def handle_watcher_event(self, payload: dict) -> dict:
         """Route a proactive watcher event through Alpha in the primary DM binding."""
@@ -664,75 +789,38 @@ class BridgeRouter:
         if binding is None:
             return {"status": "error", "error": "no_primary_dm_binding"}
 
-        inbound = InboundMessage(
-            channel="watcher",
-            chat_id=binding.chat_id,
-            thread_id=binding.thread_id,
-            chat_type=binding.chat_type,
-            user_id=0,
-            sender_name=source,
-            message_id="",
-            text=f"[source: {source}] {message}",
+        self._spawn_worker(
+            self._process_watcher_for_binding,
+            (binding, source, f"[source: {source}] {message}"),
         )
-        threading.Thread(
-            target=self._process_watcher_for_binding,
-            args=(binding, inbound),
-            daemon=True,
-        ).start()
         return {"status": "queued", "binding_id": binding.id}
 
-    def _process_watcher_for_binding(self, binding: Binding, msg: InboundMessage) -> None:
-        lock = self._get_binding_lock(binding.id)
+    def _process_watcher_for_binding(
+        self, binding: Binding, source: str, text: str
+    ) -> None:
+        if binding.agy_conversation_id:
+            self._wait_if_ssh_busy(
+                binding.agy_conversation_id, binding.chat_id, binding.thread_id, notify=False
+            )
+
+        lock = self._get_endpoint_lock(binding.channel, binding.chat_id, binding.thread_id)
         with lock:
             current = self.store.get_active_binding(
                 binding.channel, binding.chat_id, binding.thread_id
             )
             if current is None:
                 return
-            binding = current
+            self._reconcile_external_steps_locked(current)
             envelope = format_channel_envelope(
                 channel="watcher",
-                text=msg.text,
-                sender=msg.sender_name,
-                tz_label=self.config.timezone_label,
+                text=text,
+                sender=source,
+                timezone_name=self.config.timezone_name,
             )
-            conv_id = binding.agy_conversation_id
-            if conv_id:
-                with self._state_guard:
-                    self._bridge_in_flight.add(conv_id)
-            try:
-                result = self.runner.run_prompt(
-                    envelope,
-                    conversation_id=conv_id,
-                    workspace_dir=Path(binding.workspace_dir),
-                )
-            finally:
-                if conv_id:
-                    with self._state_guard:
-                        self._bridge_in_flight.discard(conv_id)
-
-            final_conv_id = result.conversation_id or conv_id
-            if final_conv_id:
-                if final_conv_id != binding.agy_conversation_id:
-                    self.store.set_conversation_id(binding.id, final_conv_id)
-                tpath = resolve_transcript_file(
-                    brain_dir=self.config.agy_brain_dir,
-                    conversation_id=final_conv_id,
-                )
-                if tpath is not None:
-                    latest = get_latest_step_index(tpath)
-                    if latest >= 0:
-                        self.store.update_watermark(binding.id, latest)
-
-            if result.status == "SUCCESS" and result.response:
-                self.telegram.send_text_or_markdown_file(
-                    binding.chat_id,
-                    result.response,
-                    thread_id=binding.thread_id,
-                )
-                self.store.log_message(
-                    binding.id,
-                    direction="out",
-                    origin="watcher",
-                    content_preview=result.response,
-                )
+            self._execute_and_deliver_locked(
+                binding=current,
+                envelope=envelope,
+                raw_user_text=text,
+                origin="watcher",
+                show_typing=False,
+            )

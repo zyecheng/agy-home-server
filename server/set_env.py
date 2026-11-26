@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 ENV_PATH = Path.home() / "agy-server" / ".env"
@@ -29,6 +30,7 @@ def main() -> int:
         print("No KEY=VALUE updates received.", file=sys.stderr)
         return 1
 
+    ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
     existing_lines = (
         ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
     )
@@ -48,12 +50,27 @@ def main() -> int:
         if key not in seen:
             out_lines.append(f"{key}={val}")
 
-    tmp_path = ENV_PATH.with_suffix(".env.tmp")
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("\n".join(out_lines) + "\n")
-    os.replace(tmp_path, ENV_PATH)
-    os.chmod(ENV_PATH, 0o600)
+    fd, tmp_name = tempfile.mkstemp(prefix=".env.", suffix=".tmp", dir=str(ENV_PATH.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except AttributeError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(out_lines) + "\n")
+        os.replace(tmp_path, ENV_PATH)
+        try:
+            os.chmod(ENV_PATH, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
     print("Updated keys:", ", ".join(sorted(updates.keys())))
     return 0
 

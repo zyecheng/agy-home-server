@@ -3,8 +3,8 @@
 
 param(
     [string]$VmName = "agy-staging",
-    [string]$OvaPath = "C:\Users\zxzha\.gemini\antigravity\scratch\agy-home-server\vm\noble-server-cloudimg-amd64.ova",
-    [string]$SeedIsoPath = "C:\Users\zxzha\.gemini\antigravity\scratch\agy-home-server\vm\cidata.iso",
+    [string]$OvaPath = (Join-Path $PSScriptRoot "..\vm\noble-server-cloudimg-amd64.ova"),
+    [string]$SeedIsoPath = (Join-Path $PSScriptRoot "..\vm\cidata.iso"),
     # Use 1 vCPU by default when Windows Hyper-V/WHPX NEM fallback is active (avoids Linux 6.8 SMP spinlock)
     [int]$Cpus = 1,
     [int]$MemoryMb = 3072,
@@ -17,8 +17,9 @@ if (-not (Test-Path $vbox)) {
     throw "VBoxManage.exe not found at $vbox"
 }
 
+$vmPattern = '"' + [regex]::Escape($VmName) + '"'
 $existing = & $vbox list vms
-if ($existing -notmatch "`"$VmName`"") {
+if (-not ($existing -match $vmPattern)) {
     Write-Host "Importing $OvaPath as $VmName..."
     & $vbox import $OvaPath --vsys 0 --vmname $VmName
     if ($LASTEXITCODE -ne 0) { throw "VBoxManage import failed" }
@@ -28,7 +29,7 @@ if ($existing -notmatch "`"$VmName`"") {
 
 # Stop VM if currently running before modifying hardware
 $running = & $vbox list runningvms
-if ($running -match "`"$VmName`"") {
+if ($running -match $vmPattern) {
     Write-Host "Powering off running VM $VmName before reconfiguration..."
     & $vbox controlvm $VmName poweroff
     Start-Sleep -Seconds 2
@@ -56,19 +57,18 @@ $info = & $vbox showvminfo $VmName --machinereadable
 $ideCtl = ($info | Select-String '^storagecontrollername\d+="([^"]*IDE[^"]*)"').Matches | Select-Object -First 1
 $sataCtl = ($info | Select-String '^storagecontrollername\d+="([^"]*SATA[^"]*)"').Matches | Select-Object -First 1
 
-if ($ideCtl) {
-    $ctlName = $ideCtl.Groups[1].Value
-    Write-Host "Attaching $SeedIsoPath to IDE controller '$ctlName' (port 1, device 0)..."
-    & $vbox storageattach $VmName --storagectl $ctlName --port 1 --device 0 --type dvddrive --medium $SeedIsoPath
-} elseif ($sataCtl) {
-    $ctlName = $sataCtl.Groups[1].Value
-    Write-Host "Attaching $SeedIsoPath to SATA controller '$ctlName' (port 1, device 0)..."
-    & $vbox storageattach $VmName --storagectl $ctlName --port 1 --device 0 --type dvddrive --medium $SeedIsoPath
+$existingCtl = if ($ideCtl) { $ideCtl } else { $sataCtl }
+if ($existingCtl) {
+    $ctlName = $existingCtl.Groups[1].Value
+    $port = 1
 } else {
-    Write-Host "Adding IDE controller and attaching $SeedIsoPath..."
-    & $vbox storagectl $VmName --name "IDE" --add ide
-    & $vbox storageattach $VmName --storagectl "IDE" --port 0 --device 0 --type dvddrive --medium $SeedIsoPath
+    $ctlName = "IDE"
+    $port = 0
+    Write-Host "Adding IDE controller..."
+    & $vbox storagectl $VmName --name $ctlName --add ide
 }
+Write-Host "Attaching $SeedIsoPath to controller '$ctlName' (port $port, device 0)..."
+& $vbox storageattach $VmName --storagectl $ctlName --port $port --device 0 --type dvddrive --medium $SeedIsoPath
 if ($LASTEXITCODE -ne 0) { throw "VBoxManage storageattach failed" }
 
 # Disable serial console file if Ubuntu OVA sets a broken host-pipe/file path

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -17,7 +18,11 @@ log = logging.getLogger("agy-bridge.telegram")
 
 def build_two_line_preview(text: str, *, max_caption_chars: int = 900) -> str:
     """Build a concise 2-line preview caption for attached .md replies."""
-    non_empty = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("```")]
+    non_empty = [
+        ln.strip()
+        for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith("```")
+    ]
     preview_lines = non_empty[:2]
     preview = "\n".join(preview_lines)
     if len(preview) > 280:
@@ -36,7 +41,46 @@ class TelegramClient:
     def configured(self) -> bool:
         return bool(self.token and self.token != "replace-me")
 
-    def _api_json(self, method: str, payload: dict | None = None, timeout: int = 40) -> dict:
+    def _send_with_retry(
+        self, req: urllib.request.Request, *, timeout: int = 40, retries: int = 2
+    ) -> dict:
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    parsed = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(parsed, dict) or not parsed.get("ok", False):
+                    raise RuntimeError(f"Telegram API error: {parsed}")
+                return parsed
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                if exc.code == 429 and attempt < retries:
+                    retry_after = 3
+                    try:
+                        body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                        retry_after = int(
+                            (body.get("parameters") or {}).get("retry_after") or 3
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(min(max(1, retry_after), 30))
+                    continue
+                if exc.code >= 500 and attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
+    def _api_json(
+        self, method: str, payload: dict | None = None, timeout: int = 40, retries: int = 2
+    ) -> dict:
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         data = json.dumps(payload or {}).encode("utf-8")
         req = urllib.request.Request(
@@ -45,8 +89,7 @@ class TelegramClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return self._send_with_retry(req, timeout=timeout, retries=retries)
 
     def _api_multipart(
         self,
@@ -84,8 +127,7 @@ class TelegramClient:
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return self._send_with_retry(req, timeout=timeout, retries=2)
 
     def get_updates(self, offset: int, timeout: int = 30) -> list[dict]:
         res = self._api_json(
@@ -96,6 +138,7 @@ class TelegramClient:
                 "allowed_updates": ["message"],
             },
             timeout=timeout + 15,
+            retries=0,
         )
         return list(res.get("result") or [])
 
@@ -106,7 +149,7 @@ class TelegramClient:
         if thread_id > 1:
             payload["message_thread_id"] = int(thread_id)
         try:
-            self._api_json("sendChatAction", payload, timeout=10)
+            self._api_json("sendChatAction", payload, timeout=10, retries=0)
         except Exception:
             pass
 
@@ -160,7 +203,6 @@ class TelegramClient:
             )
             return {"ok": True, "dry_run": True}
 
-        # Telegram hard limit is 4096 chars
         safe_text = text if len(text) <= 4090 else text[:4087] + "..."
         payload: dict = {
             "chat_id": int(chat_id),

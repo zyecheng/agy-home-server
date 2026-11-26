@@ -11,12 +11,23 @@ Type=simple
 User=agy
 WorkingDirectory=/home/agy/agy-server
 Environment="PATH=/home/agy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-EnvironmentFile=-/home/agy/agy-server/.env
 ExecStart=/usr/bin/python3 -m server.bot
 Restart=always
 RestartSec=5
+TimeoutStopSec=45
 StandardOutput=journal
 StandardError=journal
+
+# Service isolation hardening (blocks sudo escalation and tampering with bridge code/hooks/SSH keys)
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+UMask=0077
+ProtectSystem=strict
+ReadWritePaths=/home/agy/agy-server/data /home/agy/alpha-assistant /home/agy/.gemini/antigravity-cli
+ReadOnlyPaths=/home/agy/agy-server /home/agy/alpha-assistant/.agents/hooks.json /home/agy/alpha-assistant/GEMINI.md
+InaccessiblePaths=/home/agy/.ssh
 
 [Install]
 WantedBy=multi-user.target

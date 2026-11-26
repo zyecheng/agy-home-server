@@ -67,7 +67,7 @@ if ($tok -notmatch '^\d+:[A-Za-z0-9_-]+$') {
     exit 1
 }
 
-"TELEGRAM_BOT_TOKEN=$tok" | ssh -T -o BatchMode=yes $TargetHost python3 /home/agy/agy-server/server/set_env.py
+"TELEGRAM_BOT_TOKEN=$tok" | ssh -T -o BatchMode=yes $TargetHost python3 ~/agy-server/server/set_env.py
 $rc = $LASTEXITCODE
 $tok = $null
 
@@ -77,8 +77,18 @@ if ($rc -ne 0) {
 }
 
 ssh -o BatchMode=yes $TargetHost sudo systemctl restart agy-telegram.service
+if ($LASTEXITCODE -ne 0) {
+    [System.Windows.Forms.MessageBox]::Show("Token saved, but restarting agy-telegram.service failed.", "Alpha Bridge") | Out-Null
+    exit $LASTEXITCODE
+}
+
 Start-Sleep -Seconds 2
-Write-Host "Token saved securely to ${TargetHost}:~/agy-server/.env (0600) and agy-telegram.service restarted."
 $health = ssh -o BatchMode=yes $TargetHost curl -fsS http://127.0.0.1:8765/health
+if ($LASTEXITCODE -ne 0) {
+    [System.Windows.Forms.MessageBox]::Show("Bridge restarted, but /health check failed.", "Alpha Bridge") | Out-Null
+    exit $LASTEXITCODE
+}
+
+Write-Host "Token saved securely to ${TargetHost}:~/agy-server/.env (0600) and agy-telegram.service restarted."
 Write-Host "Bridge health: $health"
 [System.Windows.Forms.MessageBox]::Show("Token saved & bridge restarted.`nHealth: $health", "Alpha Bridge") | Out-Null

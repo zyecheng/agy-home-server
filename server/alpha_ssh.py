@@ -15,13 +15,43 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from server.agy_runner import build_scrubbed_env
 from server.config import BridgeConfig
-from server.db import BridgeStore
+from server.db import Binding, BridgeStore
+
+
+def select_binding(bindings: list[Binding], query: str) -> Binding | None:
+    """Resolve exact dm / numeric id / thread_id matches before substring matching."""
+    q = query.strip().lower()
+    if not q:
+        return None
+    if q == "dm":
+        return next((b for b in bindings if b.chat_type == "private"), None)
+    if q.isdigit():
+        num = int(q)
+        exact = next((b for b in bindings if b.id == num), None)
+        if exact is not None:
+            return exact
+        by_thread = next((b for b in bindings if b.thread_id == num), None)
+        if by_thread is not None:
+            return by_thread
+    by_topic = next(
+        (b for b in bindings if b.topic_name and q in b.topic_name.lower()), None
+    )
+    if by_topic is not None:
+        return by_topic
+    return next(
+        (b for b in bindings if b.agy_conversation_id and q in b.agy_conversation_id.lower()),
+        None,
+    )
 
 
 def main() -> int:
     config = BridgeConfig.from_env(REPO_ROOT / ".env")
-    store = BridgeStore(config.db_path)
+    if not config.db_path.exists():
+        print("No active channel bindings yet.")
+        return 0
+    store = BridgeStore(config.db_path, read_only=True)
     bindings = store.list_active_bindings()
     store.close()
 
@@ -38,21 +68,8 @@ def main() -> int:
         print("\nUsage: alpha-ssh <binding_id | dm | topic_substring>")
         return 0
 
-    query = " ".join(sys.argv[1:]).strip().lower()
-    target = None
-    for b in bindings:
-        if query == "dm" and b.chat_type == "private":
-            target = b
-            break
-        if query.isdigit() and (int(query) == b.id or int(query) == b.thread_id):
-            target = b
-            break
-        if b.topic_name and query in b.topic_name.lower():
-            target = b
-            break
-        if b.agy_conversation_id and query in b.agy_conversation_id.lower():
-            target = b
-            break
+    query = " ".join(sys.argv[1:]).strip()
+    target = select_binding(bindings, query)
 
     if target is None:
         print(f"No binding matched '{query}'. Run `alpha-ssh list` to see available bindings.", file=sys.stderr)
@@ -62,8 +79,7 @@ def main() -> int:
         return 1
 
     os.chdir(target.workspace_dir)
-    env = os.environ.copy()
-    env.pop("AGY_BRIDGE_ORIGIN", None)
+    env = build_scrubbed_env(config.agy_bin, bridge_origin=False)
     args = [config.agy_bin, "--conversation", target.agy_conversation_id]
     print(f"Attaching to {target.agy_conversation_id} in {target.workspace_dir} (mirror={target.mirror_mode})...")
     os.execvpe(config.agy_bin, args, env)

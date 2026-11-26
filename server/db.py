@@ -6,13 +6,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-VALID_MIRROR_MODES = ("full", "replies_only", "muted")
+from .config import VALID_MIRROR_MODES
+
+SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -33,16 +36,28 @@ class Binding:
 
 
 class BridgeStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+        if read_only:
+            uri = f"file:{self.db_path.resolve().as_posix()}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA busy_timeout=5000;")
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init_schema()
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
+            self._conn.execute("PRAGMA busy_timeout=5000;")
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._conn.executescript(
@@ -92,6 +107,7 @@ class BridgeStore:
                 );
                 """
             )
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
     def close(self) -> None:
         with self._lock:
