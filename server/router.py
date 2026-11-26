@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agy_runner import AgyResult, AgyRunner, format_channel_envelope
+from .approvals import ApprovalManager, DEFAULT_APPROVAL_TIMEOUT_SECONDS
 from .config import VALID_MIRROR_MODES, BridgeConfig
 from .db import Binding, BridgeStore
 from .failure_analyzer import (
@@ -57,11 +58,17 @@ class BridgeRouter:
         store: BridgeStore,
         runner: AgyRunner,
         telegram: TelegramClient,
+        *,
+        approval_timeout_seconds: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
         self.store = store
         self.runner = runner
         self.telegram = telegram
+        self.approvals = ApprovalManager(
+            telegram,
+            timeout_seconds=approval_timeout_seconds,
+        )
 
         # Locks keyed by normalized endpoint (channel, chat_id, thread_id) so
         # /reset cannot split two threads across different lock objects.
@@ -112,8 +119,9 @@ class BridgeRouter:
         return t
 
     def shutdown(self, timeout_seconds: float = 35.0) -> None:
-        """Cancel pending timers, flush queued debounce batches, and join active workers."""
+        """Fail-close pending approvals, cancel timers, flush debounce batches, and join workers."""
         self._shutting_down.set()
+        self.approvals.cancel_all()
         pending_to_flush: list[list[InboundMessage]] = []
         with self._debounce_guard:
             for _gen, timer in self._debounce_timers.values():
@@ -157,6 +165,11 @@ class BridgeRouter:
         return True
 
     def handle_telegram_update(self, update: dict) -> None:
+        cb = update.get("callback_query")
+        if isinstance(cb, dict):
+            self._handle_callback_query(cb)
+            return
+
         msg = update.get("message")
         if not isinstance(msg, dict):
             return
@@ -231,6 +244,42 @@ class BridgeRouter:
 
         self.enqueue_inbound(inbound)
 
+    def _handle_callback_query(self, cb: dict) -> None:
+        sender = cb.get("from") or {}
+        msg = cb.get("message") or {}
+        chat = msg.get("chat") or {}
+        user_id = sender.get("id")
+        chat_id = chat.get("id")
+        is_bot = bool(sender.get("is_bot", False))
+        if chat_id is None or user_id is None:
+            return
+        if not self.is_authorized_telegram(user_id, chat_id, is_bot=is_bot):
+            log.warning(
+                "Ignored unauthorized Telegram callback_query (user_id=%s chat_id=%s is_bot=%s)",
+                user_id,
+                chat_id,
+                is_bot,
+            )
+            return
+
+        cb_id = str(cb.get("id") or "")
+        cb_data = str(cb.get("data") or "")
+        if not cb_data:
+            return
+        self._spawn_worker(
+            self._resolve_approval_callback,
+            (str(chat_id), cb_id, cb_data),
+        )
+
+    def _resolve_approval_callback(
+        self, chat_id: str, callback_query_id: str, callback_data: str
+    ) -> None:
+        self.approvals.resolve_callback(
+            chat_id=chat_id,
+            callback_query_id=callback_query_id,
+            callback_data=callback_data,
+        )
+
     def enqueue_inbound(self, msg: InboundMessage) -> None:
         key = (msg.channel, msg.chat_id, msg.thread_id)
         delay = max(0.0, self.config.debounce_seconds)
@@ -300,6 +349,7 @@ class BridgeRouter:
         conv_id: str | None,
         workspace_dir: Path,
         timeout_seconds: int | None = None,
+        binding_id: int | None = None,
     ) -> AgyResult:
         if conv_id:
             with self._state_guard:
@@ -310,6 +360,7 @@ class BridgeRouter:
                 conversation_id=conv_id,
                 workspace_dir=workspace_dir,
                 timeout_seconds=timeout_seconds,
+                binding_id=binding_id,
             )
         finally:
             if conv_id:
@@ -412,6 +463,7 @@ class BridgeRouter:
                     envelope,
                     conv_id=conv_id,
                     workspace_dir=Path(binding.workspace_dir),
+                    binding_id=binding.id,
                 )
             except Exception as exc:
                 log.exception("agy runner crashed for binding %s", binding.id)
@@ -638,8 +690,87 @@ class BridgeRouter:
         self.enqueue_inbound(msg)
 
     # ------------------------------------------------------------------
-    # Hook & Watcher IPC handlers (called by authenticated localhost IPC)
+    # Hook, Approval & Watcher IPC handlers (called by authenticated localhost IPC)
     # ------------------------------------------------------------------
+
+    def handle_approval_request(self, payload: dict) -> dict:
+        """Prompt the user on Telegram with Approve/Deny buttons (fail-closed, lock-free)."""
+        if self._shutting_down.is_set():
+            return {"decision": "deny", "reason": "Bridge is shutting down (fail-closed)."}
+
+        tool_call = payload.get("toolCall")
+        if not isinstance(tool_call, dict):
+            return {"decision": "deny", "reason": "Invalid toolCall payload (fail-closed)."}
+
+        tool_name = str(tool_call.get("name") or "").strip()
+        if not tool_name:
+            return {"decision": "deny", "reason": "Missing tool name (fail-closed)."}
+        raw_args = tool_call.get("args")
+        if raw_args is None:
+            tool_args: dict = {}
+        elif isinstance(raw_args, dict):
+            tool_args = raw_args
+        else:
+            return {"decision": "deny", "reason": "Invalid tool args (fail-closed)."}
+
+        conv_id = str(payload.get("conversationId") or "").strip()
+        raw_binding_id = str(payload.get("bindingId") or "").strip()
+
+        binding: Binding | None = None
+        if raw_binding_id.isdigit():
+            binding = self.store.get_binding_by_id(int(raw_binding_id))
+            if (
+                binding is not None
+                and binding.agy_conversation_id
+                and conv_id
+                and binding.agy_conversation_id != conv_id
+            ):
+                log.warning(
+                    "Approval bindingId=%s conversation mismatch (%s != %s); denying fail-closed",
+                    binding.id,
+                    binding.agy_conversation_id,
+                    conv_id,
+                )
+                return {
+                    "decision": "deny",
+                    "reason": "Binding/conversation mismatch (fail-closed).",
+                }
+
+        if binding is None and conv_id and is_safe_conversation_id(conv_id):
+            binding = self.store.get_binding_by_conversation(conv_id)
+
+        if binding is None:
+            log.warning(
+                "Approval request for tool=%s had no active binding (bindingId=%s conv=%s); denying",
+                tool_name,
+                raw_binding_id or "-",
+                conv_id or "-",
+            )
+            return {
+                "decision": "deny",
+                "reason": "No active Telegram binding for approval request (fail-closed).",
+            }
+
+        log.info(
+            "Requesting Telegram approval (binding=%s chat=%s thread=%s tool=%s)",
+            binding.id,
+            binding.chat_id,
+            binding.thread_id,
+            tool_name,
+        )
+        res = self.approvals.request_approval(
+            chat_id=binding.chat_id,
+            thread_id=binding.thread_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+        )
+        log.info(
+            "Telegram approval resolved (binding=%s tool=%s decision=%s)",
+            binding.id,
+            tool_name,
+            res.get("decision"),
+        )
+        return res
 
     def handle_hook_event(self, payload: dict, *, sync_mirror: bool = False) -> dict:
         event = str(payload.get("event") or "")

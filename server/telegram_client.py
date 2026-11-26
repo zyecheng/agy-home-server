@@ -135,7 +135,7 @@ class TelegramClient:
             {
                 "timeout": timeout,
                 "offset": offset,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             },
             timeout=timeout + 15,
             retries=0,
@@ -192,6 +192,7 @@ class TelegramClient:
         *,
         thread_id: int = 0,
         disable_notification: bool = False,
+        reply_markup: dict | None = None,
     ) -> dict:
         if not self.configured:
             log.info(
@@ -211,7 +212,36 @@ class TelegramClient:
         }
         if thread_id > 1:
             payload["message_thread_id"] = int(thread_id)
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         return self._api_json("sendMessage", payload)
+
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict:
+        if not self.configured:
+            return {"ok": True, "dry_run": True}
+        payload: dict = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text[:200]
+        return self._api_json("answerCallbackQuery", payload, timeout=10, retries=0)
+
+    def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        if not self.configured:
+            return {"ok": True, "dry_run": True}
+        safe_text = text if len(text) <= 4090 else text[:4087] + "..."
+        payload: dict = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "text": safe_text,
+            "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
+        }
+        return self._api_json("editMessageText", payload, timeout=15, retries=1)
 
     def send_document(
         self,

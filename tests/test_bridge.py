@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,6 +40,9 @@ class FakeTelegram(TelegramClient):
         )
         self.sent_messages: list[dict] = []
         self.sent_documents: list[dict] = []
+        self.answered_callbacks: list[dict] = []
+        self.edited_messages: list[dict] = []
+        self._msg_seq = 100
 
     def send_message(
         self,
@@ -47,14 +51,49 @@ class FakeTelegram(TelegramClient):
         *,
         thread_id: int = 0,
         disable_notification: bool = False,
+        reply_markup: dict | None = None,
     ) -> dict:
+        self._msg_seq += 1
+        msg_id = self._msg_seq
         item = {
+            "message_id": msg_id,
             "chat_id": str(chat_id),
             "thread_id": thread_id,
             "text": text,
             "silent": disable_notification,
+            "reply_markup": reply_markup,
         }
         self.sent_messages.append(item)
+        return {"ok": True, "result": {"message_id": msg_id}}
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str = "",
+        show_alert: bool = False,
+    ) -> dict:
+        self.answered_callbacks.append(
+            {"id": callback_query_id, "text": text, "show_alert": show_alert}
+        )
+        return {"ok": True}
+
+    def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        self.edited_messages.append(
+            {
+                "chat_id": str(chat_id),
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": reply_markup,
+            }
+        )
         return {"ok": True}
 
     def send_document(
@@ -92,6 +131,7 @@ class FakeRunner:
         conversation_id=None,
         workspace_dir=None,
         timeout_seconds=None,
+        binding_id=None,
     ) -> AgyResult:
         idx = len(self.calls)
         self.calls.append(
@@ -100,6 +140,7 @@ class FakeRunner:
                 "conversation_id": conversation_id,
                 "cwd": workspace_dir,
                 "timeout_seconds": timeout_seconds,
+                "binding_id": binding_id,
             }
         )
         if self.on_call is not None:
@@ -527,6 +568,274 @@ class BridgeTestCase(unittest.TestCase):
         self.assertIn("permission_denied", sent_text)
         self.assertIn("df -h", sent_text)
         self.assertNotIn("agy error (SUCCESS)", sent_text)
+
+    def test_interactive_approval_turn1_ipc_approve_and_single_use(self) -> None:
+        token = ensure_ipc_token(self.cfg.ipc_token_path)
+        binding = self.store.get_or_create_binding(
+            "telegram", "111", 0, "private", str(self.workspace)
+        )
+        # Note: Turn 1 has agy_conversation_id == None; must resolve via bindingId
+        router = BridgeRouter(
+            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=5.0  # type: ignore[arg-type]
+        )
+        srv = start_ipc_server(self.cfg, router, token)
+        port = srv.server_address[1]
+        base_url = f"http://127.0.0.1:{port}"
+        try:
+            # Unauthenticated POST /approve must be rejected
+            req_unauth = urllib.request.Request(
+                f"{base_url}/approve",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_unauth, timeout=3)
+            self.assertEqual(ctx.exception.code, 401)
+
+            result_holder: dict = {}
+
+            def _call_approve() -> None:
+                req = urllib.request.Request(
+                    f"{base_url}/approve",
+                    data=json.dumps(
+                        {
+                            "conversationId": "conv-turn1-brand-new",
+                            "bindingId": str(binding.id),
+                            "toolCall": {
+                                "name": "run_command",
+                                "args": {"CommandLine": "uptime && free -h", "Cwd": "/home/agy"},
+                            },
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "X-Bridge-Token": token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    result_holder["status"] = resp.status
+                    result_holder["body"] = json.loads(resp.read().decode("utf-8"))
+
+            t = threading.Thread(target=_call_approve)
+            t.start()
+
+            deadline = time.time() + 2.0
+            while not self.tg.sent_messages and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(len(self.tg.sent_messages), 1)
+            prompt_msg = self.tg.sent_messages[0]
+            self.assertIn("uptime && free -h", prompt_msg["text"])
+            buttons = prompt_msg["reply_markup"]["inline_keyboard"][0]
+            approve_data = buttons[0]["callback_data"]
+            self.assertTrue(approve_data.startswith("ap:"))
+
+            router.handle_telegram_update(
+                {
+                    "update_id": 100,
+                    "callback_query": {
+                        "id": "cbq-1",
+                        "from": {"id": 111, "is_bot": False},
+                        "message": {"chat": {"id": 111}, "message_id": prompt_msg["message_id"]},
+                        "data": approve_data,
+                    },
+                }
+            )
+            t.join(timeout=3.0)
+            router.shutdown(timeout_seconds=3.0)
+
+            self.assertEqual(result_holder.get("status"), 200)
+            self.assertEqual(result_holder["body"]["decision"], "auto_approve")
+            self.assertEqual(self.tg.answered_callbacks[0]["text"], "Approved")
+            self.assertIn("Approved via Telegram", self.tg.edited_messages[0]["text"])
+
+            # Single-use: replaying the same nonce returns False
+            self.assertFalse(
+                router.approvals.resolve_callback(
+                    chat_id="111", callback_query_id="cbq-2", callback_data=approve_data
+                )
+            )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_interactive_approval_blocks_spoofing_and_supports_deny(self) -> None:
+        binding = self.store.get_or_create_binding(
+            "telegram", "111", 0, "private", str(self.workspace)
+        )
+        self.store.set_conversation_id(binding.id, "conv-deny-1")
+        router = BridgeRouter(
+            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=5.0  # type: ignore[arg-type]
+        )
+
+        outcome: dict = {}
+
+        def _req() -> None:
+            outcome["res"] = router.handle_approval_request(
+                {
+                    "conversationId": "conv-deny-1",
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "rm -rf /tmp/x"}},
+                }
+            )
+
+        t = threading.Thread(target=_req)
+        t.start()
+        deadline = time.time() + 2.0
+        while not self.tg.sent_messages and time.time() < deadline:
+            time.sleep(0.02)
+        buttons = self.tg.sent_messages[0]["reply_markup"]["inline_keyboard"][0]
+        approve_data = buttons[0]["callback_data"]
+        deny_data = buttons[1]["callback_data"]
+
+        # Unauthorized user tapping Approve must be ignored
+        router.handle_telegram_update(
+            {
+                "update_id": 101,
+                "callback_query": {
+                    "id": "cbq-unauth",
+                    "from": {"id": 999, "is_bot": False},
+                    "message": {"chat": {"id": 111}},
+                    "data": approve_data,
+                },
+            }
+        )
+        # Bot user tapping Approve must be ignored
+        router.handle_telegram_update(
+            {
+                "update_id": 102,
+                "callback_query": {
+                    "id": "cbq-bot",
+                    "from": {"id": 111, "is_bot": True},
+                    "message": {"chat": {"id": 111}},
+                    "data": approve_data,
+                },
+            }
+        )
+        # Wrong chat_id must fail chat mismatch and keep pending approval intact
+        self.assertFalse(
+            router.approvals.resolve_callback(
+                chat_id="-100888", callback_query_id="cbq-wrong-chat", callback_data=approve_data
+            )
+        )
+        self.assertTrue(t.is_alive())
+
+        # Legitimate owner tapping Deny resolves cleanly
+        router.handle_telegram_update(
+            {
+                "update_id": 103,
+                "callback_query": {
+                    "id": "cbq-deny",
+                    "from": {"id": 111, "is_bot": False},
+                    "message": {"chat": {"id": 111}},
+                    "data": deny_data,
+                },
+            }
+        )
+        t.join(timeout=3.0)
+        router.shutdown(timeout_seconds=3.0)
+
+        self.assertEqual(outcome["res"]["decision"], "deny")
+        self.assertIn("Denied via Telegram", self.tg.edited_messages[0]["text"])
+
+    def test_interactive_approval_timeout_shutdown_and_mismatch_fail_closed(self) -> None:
+        binding = self.store.get_or_create_binding(
+            "telegram", "111", 0, "private", str(self.workspace)
+        )
+        self.store.set_conversation_id(binding.id, "conv-bound-1")
+
+        # 1. Timeout fail-closed
+        router_to = BridgeRouter(
+            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=0.1  # type: ignore[arg-type]
+        )
+        res_to = router_to.handle_approval_request(
+            {
+                "bindingId": str(binding.id),
+                "conversationId": "conv-bound-1",
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "sleep 1"}},
+            }
+        )
+        self.assertEqual(res_to["decision"], "deny")
+        self.assertIn("Timed out", self.tg.edited_messages[-1]["text"])
+
+        # 2. Binding/conversation mismatch fail-closed without prompting
+        sent_before = len(self.tg.sent_messages)
+        res_mismatch = router_to.handle_approval_request(
+            {
+                "bindingId": str(binding.id),
+                "conversationId": "conv-different",
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "id"}},
+            }
+        )
+        self.assertEqual(res_mismatch["decision"], "deny")
+        self.assertEqual(len(self.tg.sent_messages), sent_before)
+
+        # 3. Unknown binding fail-closed
+        res_missing = router_to.handle_approval_request(
+            {
+                "conversationId": "conv-unknown",
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "id"}},
+            }
+        )
+        self.assertEqual(res_missing["decision"], "deny")
+
+        # 4. Shutdown immediately cancels pending approvals fail-closed
+        router_sd = BridgeRouter(
+            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=30.0  # type: ignore[arg-type]
+        )
+        sd_out: dict = {}
+        t = threading.Thread(
+            target=lambda: sd_out.setdefault(
+                "res",
+                router_sd.handle_approval_request(
+                    {
+                        "conversationId": "conv-bound-1",
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": "uptime"}},
+                    }
+                ),
+            )
+        )
+        t.start()
+        deadline = time.time() + 2.0
+        while len(self.tg.sent_messages) == sent_before + 1 and time.time() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.05)
+        router_sd.shutdown(timeout_seconds=2.0)
+        t.join(timeout=2.0)
+        self.assertEqual(sd_out["res"]["decision"], "deny")
+
+    def test_hook_approve_script_allows_ssh_and_fails_closed_for_bridge(self) -> None:
+        script = Path(__file__).resolve().parent.parent / "server" / "hook_approve.py"
+        sample_in = json.dumps(
+            {
+                "conversationId": "conv-1",
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "uptime"}},
+            }
+        )
+        # SSH session (AGY_BRIDGE_ORIGIN unset) -> allow
+        env_ssh = {k: v for k, v in os.environ.items() if not k.startswith("AGY_BRIDGE_")}
+        proc_ssh = subprocess.run(
+            [sys.executable, str(script)],
+            input=sample_in,
+            text=True,
+            capture_output=True,
+            env=env_ssh,
+            timeout=10,
+        )
+        self.assertEqual(proc_ssh.returncode, 0)
+        self.assertEqual(json.loads(proc_ssh.stdout)["decision"], "allow")
+
+        # Bridge session with missing token -> strictly deny (fail-closed)
+        env_bridge = dict(env_ssh)
+        env_bridge["AGY_BRIDGE_ORIGIN"] = "bridge"
+        env_bridge["BRIDGE_IPC_TOKEN_PATH"] = str(self.root / "nonexistent.token")
+        proc_bridge = subprocess.run(
+            [sys.executable, str(script)],
+            input=sample_in,
+            text=True,
+            capture_output=True,
+            env=env_bridge,
+            timeout=10,
+        )
+        self.assertEqual(proc_bridge.returncode, 0)
+        self.assertEqual(json.loads(proc_bridge.stdout)["decision"], "deny")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 # Alpha 24/7 Home AI Server — Architecture & Design Document
 
-> **Status:** v1.1 Hardened & Verified on Staging VM (`agy-staging`)  
+> **Status:** v1.2 Hardened + Interactive Telegram Approvals (`PreToolUse`) on Staging VM (`agy-staging`)  
 > **Repository:** `agy-home-server`  
 > **Last Updated:** 2026-11-26
 
@@ -215,23 +215,25 @@ sequenceDiagram
 | `GEMINI.md` | Always-on workspace rules & Windows/VM guardrails |
 | `.agents/skills/staging-vm/` | Antigravity skill + `vm.ps1` lifecycle CLI |
 | `alpha-workspace/GEMINI.md` | Alpha bilingual persona deployed to `~/alpha-assistant/` |
-| `alpha-workspace/.agents/hooks.json` | Antigravity `PreInvocation` + `Stop` hook config |
-| `server/bot.py` | Main daemon: Telegram long-poller + authenticated `127.0.0.1:8765` IPC |
+| `alpha-workspace/.agents/hooks.json` | Antigravity `PreInvocation`, `Stop`, and `PreToolUse` hook config |
+| `server/bot.py` | Main daemon: Telegram long-poller + authenticated `127.0.0.1:8765` IPC (`/health`, `/hook`, `/approve`, `/watcher`) |
 | `server/config.py` | `.env` parser (no `os.environ` mutation), validation, `0600` IPC token helper |
-| `server/router.py` | Endpoint-locked router, generation-guarded debouncer, commands, SSH syncer |
+| `server/router.py` | Endpoint-locked router, generation-guarded debouncer, commands, approval & SSH sync handlers |
+| `server/approvals.py` | Lock-free, fail-closed Telegram inline-button approval manager (120s TTL, single-use nonce) |
 | `server/db.py` | SQLite WAL store (`bindings`, `message_log`, `kv_state`, read-only URI mode) |
-| `server/agy_runner.py` | Headless `agy -p` subprocess wrapper, scrubbed env, `ZoneInfo` timestamps |
+| `server/agy_runner.py` | Headless `agy -p` subprocess wrapper, scrubbed env (`AGY_BRIDGE_ORIGIN`, `AGY_BRIDGE_BINDING_ID`), `ZoneInfo` timestamps |
 | `server/failure_analyzer.py` | Two-stage failure classifier + delimited Alpha recovery prompt builder |
 | `server/transcript.py` | Contained `transcript_full.jsonl` / `transcript.jsonl` streaming parser |
-| `server/telegram_client.py` | Stdlib Telegram Bot API client (retry/429, `.md` upload >3,500 chars) |
-| `server/hook_notify.py` | Non-blocking authenticated Antigravity hook → localhost IPC forwarder |
+| `server/telegram_client.py` | Stdlib Telegram Bot API client (retry/429, inline keyboards/callbacks, `.md` upload >3,500 chars) |
+| `server/hook_notify.py` | Non-blocking authenticated `PreInvocation`/`Stop` hook → localhost IPC forwarder |
+| `server/hook_approve.py` | Strictly fail-closed `PreToolUse` hook → `POST /approve` Telegram approval gate |
 | `server/alpha_ssh.py` | Read-only SSH helper CLI (`alpha-ssh`) with exact numeric ID matching |
 | `server/set_env.py` | Exclusive `0600` atomic `.env` updater |
 | `scripts/deploy.ps1` | Binary-safe Windows → Linux deployment script with `/health` verification |
 | `scripts/setup-vm.ps1` & `build-cidata-iso.ps1` | Reproducible VirtualBox + `cloud-init` provisioning |
 | `scripts/set-bot-token.ps1` | Masked Windows GUI secret injector |
 | `systemd/agy-telegram.service` | Hardened `systemd` unit for 24/7 auto-restart |
-| `tests/test_bridge.py` | Unit & integration test suite (13 tests) |
+| `tests/test_bridge.py` | Unit & integration test suite (17 tests) |
 
 ---
 
@@ -239,9 +241,10 @@ sequenceDiagram
 
 1. **Headless Tool Permissions & Timezone (immediate):**
    - Set VM timezone to `America/Los_Angeles` and configure `~/.gemini/antigravity-cli/settings.json` with least-privilege allowlists (or `always-proceed` **only** in tandem with the `systemd` isolation above + `PreToolUse` approval gates below — never relying on command denylists alone).
-2. **Interactive Telegram Approvals (`PreToolUse` Hook — Fail-Closed Contract):**
-   - Must **not** reuse `hook_notify.py`'s fail-open `allow` behavior or `AGY_BRIDGE_ORIGIN=bridge` skip.
-   - Enable `callback_query` in `allowed_updates`, authenticate `callback_query.from.id` + `chat_id` server-side, bind each button to a single-use random nonce + `(tool_name, args_sha256)` + short TTL, run approval IPC outside the endpoint lock (avoiding deadlock with `_process_batch`), and **fail closed to `deny`** on timeout, IPC error, or bridge restart.
+2. **Interactive Telegram Approvals (`PreToolUse` Hook — Implemented in v1.2):**
+   - Separate strictly fail-closed `server/hook_approve.py` + lock-free `server/approvals.py` (`POST /approve` with `X-Bridge-Token`).
+   - Passes `AGY_BRIDGE_BINDING_ID` into headless `agy -p` turns so Turn-1 tool calls resolve the target Telegram chat/topic before `agy_conversation_id` is saved.
+   - Enables `callback_query` in `allowed_updates`, authenticates `callback_query.from.id` + `chat_id` server-side, binds each button to a single-use 24-hex nonce + tool/args SHA-256 digest + 120s TTL, and fails closed to `deny` on timeout, IPC error, or daemon shutdown. Manual SSH sessions (`AGY_BRIDGE_ORIGIN` unset) pass through via `allow`.
 3. **Multimodal Telegram Inputs:**
    - Download incoming photos, files, voice notes, and locations into `~/alpha-assistant/inbox/<conv_id>/` with sanitized filenames, canonical `is_relative_to` confinement, max file size caps, and automated TTL pruning (disk hygiene for 256 GB NVMe).
 4. **Memory, Retention & Watchers:**

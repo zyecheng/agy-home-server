@@ -205,6 +205,14 @@ class BridgeStore:
             assert binding is not None
             return binding
 
+    def get_binding_by_id(self, binding_id: int) -> Binding | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM bindings WHERE id = ? AND active = 1",
+                (int(binding_id),),
+            ).fetchone()
+            return self._row_to_binding(row)
+
     def get_binding_by_conversation(self, agy_conversation_id: str) -> Binding | None:
         with self._lock:
             row = self._conn.execute(

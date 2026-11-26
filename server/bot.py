@@ -97,6 +97,10 @@ def start_ipc_server(
                 res = router.handle_hook_event(payload)
                 self._send_json(200, res)
                 return
+            if self.path == "/approve":
+                res = router.handle_approval_request(payload)
+                self._send_json(200, res)
+                return
             if self.path == "/watcher":
                 res = router.handle_watcher_event(payload)
                 code = 200 if res.get("status") != "error" else 400
@@ -171,6 +175,7 @@ def main() -> int:
                 log.exception("Unexpected error in Telegram polling loop")
                 stop_event.wait(5.0)
     finally:
+        router.approvals.cancel_all()
         ipc.shutdown()
         ipc.server_close()
         router.shutdown(timeout_seconds=35.0)

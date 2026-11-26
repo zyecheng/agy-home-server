@@ -72,7 +72,12 @@ def format_channel_envelope(
     return "\n".join(lines)
 
 
-def build_scrubbed_env(agy_bin: str, *, bridge_origin: bool = True) -> dict[str, str]:
+def build_scrubbed_env(
+    agy_bin: str,
+    *,
+    bridge_origin: bool = True,
+    binding_id: int | None = None,
+) -> dict[str, str]:
     """Build a child process environment with bridge/Telegram secrets removed."""
     env = {
         k: v
@@ -87,8 +92,13 @@ def build_scrubbed_env(agy_bin: str, *, bridge_origin: bool = True) -> dict[str,
             env["PATH"] = os.pathsep.join([bin_dir, *path_parts])
     if bridge_origin:
         env["AGY_BRIDGE_ORIGIN"] = "bridge"
+        if binding_id is not None:
+            env["AGY_BRIDGE_BINDING_ID"] = str(int(binding_id))
+        else:
+            env.pop("AGY_BRIDGE_BINDING_ID", None)
     else:
         env.pop("AGY_BRIDGE_ORIGIN", None)
+        env.pop("AGY_BRIDGE_BINDING_ID", None)
     return env
 
 
@@ -124,6 +134,7 @@ class AgyRunner:
         conversation_id: str | None = None,
         workspace_dir: Path | None = None,
         timeout_seconds: int | None = None,
+        binding_id: int | None = None,
     ) -> AgyResult:
         cwd = workspace_dir or self.config.alpha_workspace
         cwd.mkdir(parents=True, exist_ok=True)
@@ -148,7 +159,11 @@ class AgyRunner:
         if eff_timeout > 0:
             cmd.extend(["--print-timeout", f"{eff_timeout}s"])
 
-        env = build_scrubbed_env(self.config.agy_bin, bridge_origin=True)
+        env = build_scrubbed_env(
+            self.config.agy_bin,
+            bridge_origin=True,
+            binding_id=binding_id,
+        )
         sub_timeout = eff_timeout + 30 if eff_timeout > 0 else None
 
         log.info(

@@ -33,7 +33,7 @@ trap 'rm -f "`$ARCHIVE"' EXIT
 tar -xzf "`$ARCHIVE" -C "`$REMOTE_DIR"
 rm -f "`$ARCHIVE"
 find "`$REMOTE_DIR/server" "`$REMOTE_DIR/systemd" "`$REMOTE_DIR/alpha-workspace" "`$REMOTE_DIR/tests" -type f -exec sed -i 's/\r`$//' {} +
-chmod +x "`$REMOTE_DIR/server/bot.py" "`$REMOTE_DIR/server/hook_notify.py" "`$REMOTE_DIR/server/alpha_ssh.py" "`$REMOTE_DIR/server/set_env.py"
+chmod +x "`$REMOTE_DIR/server/bot.py" "`$REMOTE_DIR/server/hook_notify.py" "`$REMOTE_DIR/server/hook_approve.py" "`$REMOTE_DIR/server/alpha_ssh.py" "`$REMOTE_DIR/server/set_env.py"
 cp "`$REMOTE_DIR/alpha-workspace/GEMINI.md" ~/alpha-assistant/GEMINI.md
 cp "`$REMOTE_DIR/alpha-workspace/.agents/hooks.json" ~/alpha-assistant/.agents/hooks.json
 ln -sf "`$REMOTE_DIR/server/alpha_ssh.py" ~/.local/bin/alpha-ssh
