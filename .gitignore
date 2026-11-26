@@ -1,4 +1,5 @@
 .env
+data/
 vm/*.ova
 vm/*.iso
 vm/*.exe
