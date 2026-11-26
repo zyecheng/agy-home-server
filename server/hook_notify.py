@@ -34,7 +34,9 @@ def _notify_bridge(event: str) -> None:
 
     from server.config import parse_dotenv
 
-    env_vals = parse_dotenv(REPO_ROOT / ".env")
+    env_override = os.environ.get("BRIDGE_ENV_FILE")
+    env_path = Path(env_override) if env_override else (REPO_ROOT / ".env")
+    env_vals = parse_dotenv(env_path)
     ipc_host = (
         os.environ.get("BRIDGE_IPC_HOST") or env_vals.get("BRIDGE_IPC_HOST") or "127.0.0.1"
     ).strip()

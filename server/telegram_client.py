@@ -33,9 +33,16 @@ def build_two_line_preview(text: str, *, max_caption_chars: int = 900) -> str:
 
 
 class TelegramClient:
-    def __init__(self, token: str, *, max_inline_chars: int = 3500) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        max_inline_chars: int = 3500,
+        api_base_url: str = "https://api.telegram.org",
+    ) -> None:
         self.token = token
         self.max_inline_chars = max_inline_chars
+        self.api_base_url = api_base_url.rstrip("/")
 
     @property
     def configured(self) -> bool:
@@ -81,7 +88,7 @@ class TelegramClient:
     def _api_json(
         self, method: str, payload: dict | None = None, timeout: int = 40, retries: int = 2
     ) -> dict:
-        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        url = f"{self.api_base_url}/bot{self.token}/{method}"
         data = json.dumps(payload or {}).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -120,7 +127,7 @@ class TelegramClient:
         chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
         body = b"".join(chunks)
 
-        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        url = f"{self.api_base_url}/bot{self.token}/{method}"
         req = urllib.request.Request(
             url,
             data=body,

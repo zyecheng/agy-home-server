@@ -5,15 +5,21 @@
 Description=Antigravity Home AI Server Telegram Bridge
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=15
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
 User=agy
 WorkingDirectory=/home/agy/agy-server
 Environment="PATH=/home/agy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/usr/bin/python3 -m server.bot
 Restart=always
 RestartSec=5
+KillMode=control-group
+OOMScoreAdjust=-200
 TimeoutStopSec=45
 StandardOutput=journal
 StandardError=journal

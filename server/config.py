@@ -9,9 +9,24 @@ import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 VALID_MIRROR_MODES = ("full", "replies_only", "muted")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org"
+
+
+def validate_telegram_api_base_url(raw: str) -> str:
+    """Allow only official Telegram API HTTPS or loopback HTTP (for local E2E tests)."""
+    url = (raw or DEFAULT_TELEGRAM_API_BASE_URL).strip().rstrip("/")
+    parsed = urlparse(url)
+    if parsed.scheme == "https" and parsed.hostname == "api.telegram.org" and not parsed.path:
+        return url
+    if parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS and not parsed.path:
+        return url
+    raise ValueError(
+        f"Refusing TELEGRAM_API_BASE_URL '{url}'; must be https://api.telegram.org or loopback http://"
+    )
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -95,6 +110,8 @@ class BridgeConfig:
     ipc_port: int
     ipc_token_path: Path
     timezone_name: str
+    telegram_api_base_url: str = DEFAULT_TELEGRAM_API_BASE_URL
+    approval_timeout_seconds: float = 120.0
 
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> "BridgeConfig":
@@ -125,6 +142,12 @@ class BridgeConfig:
         ipc_token_path = Path(
             get("BRIDGE_IPC_TOKEN_PATH", str(db_path.parent / "ipc.token"))
         )
+        telegram_api_base_url = validate_telegram_api_base_url(
+            get("TELEGRAM_API_BASE_URL", DEFAULT_TELEGRAM_API_BASE_URL)
+        )
+        approval_timeout_seconds = max(
+            0.05, _parse_float(get("APPROVAL_TIMEOUT_SECONDS", "120"), 120.0)
+        )
 
         return cls(
             telegram_bot_token=get("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -151,4 +174,6 @@ class BridgeConfig:
             ipc_port=_parse_int(get("BRIDGE_IPC_PORT", "8765"), 8765),
             ipc_token_path=ipc_token_path,
             timezone_name=get("BRIDGE_TIMEZONE", "America/Los_Angeles").strip(),
+            telegram_api_base_url=telegram_api_base_url,
+            approval_timeout_seconds=approval_timeout_seconds,
         )

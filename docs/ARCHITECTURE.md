@@ -2,7 +2,7 @@
 
 # Alpha 24/7 Home AI Server — Architecture & Design Document
 
-> **Status:** v1.2 Hardened + Interactive Telegram Approvals (`PreToolUse`) on Staging VM (`agy-staging`)  
+> **Status:** v1.3 Hardened + Interactive Approvals + Crash-Recovery Watchdog + Full E2E/Stress Suite on Staging VM (`agy-staging`)  
 > **Repository:** `agy-home-server`  
 > **Last Updated:** 2026-11-26
 
@@ -104,6 +104,7 @@ To keep personal Alpha interactions isolated from plain engineering/admin work a
 **Service Isolation (`systemd/agy-telegram.service`):**
 - `NoNewPrivileges=yes`, `RestrictSUIDSGID=yes`, `CapabilityBoundingSet=` block `sudo` escalation from any bridge-spawned `agy` subprocess even when the `agy` OS user has `sudo` for SSH admin deploys.
 - `ProtectSystem=strict`, `PrivateTmp=yes`, `UMask=0077`, `InaccessiblePaths=/home/agy/.ssh`, `ReadOnlyPaths=/home/agy/agy-server /home/agy/alpha-assistant/.agents/hooks.json /home/agy/alpha-assistant/GEMINI.md`, and `ReadWritePaths=/home/agy/agy-server/data /home/agy/alpha-assistant /home/agy/.gemini/antigravity-cli`.
+- **Crash & Hang Recovery:** `Type=notify` + `NotifyAccess=main` + `WatchdogSec=120` (stdlib `sd_notify` heartbeat every poll loop), `Restart=always`, `RestartSec=5`, `StartLimitIntervalSec=300` / `StartLimitBurst=15`, `KillMode=control-group`, and `OOMScoreAdjust=-200`. On startup, `bot.py` reconciles any finished-but-undelivered transcript steps (`step_index > last_mirrored_step`) and, if `kv_state.clean_shutdown == "0"` (previous `SIGKILL`/OOM/power loss), sends a silent recovery notice to the primary DM.
 - **Production hardening (HP Elite 600 G9):** Run `agy-telegram.service` under a dedicated non-sudo service user separate from the SSH admin account.
 
 ---
@@ -232,8 +233,11 @@ sequenceDiagram
 | `scripts/deploy.ps1` | Binary-safe Windows → Linux deployment script with `/health` verification |
 | `scripts/setup-vm.ps1` & `build-cidata-iso.ps1` | Reproducible VirtualBox + `cloud-init` provisioning |
 | `scripts/set-bot-token.ps1` | Masked Windows GUI secret injector |
-| `systemd/agy-telegram.service` | Hardened `systemd` unit for 24/7 auto-restart |
-| `tests/test_bridge.py` | Unit & integration test suite (17 tests) |
+| `systemd/agy-telegram.service` | Hardened `systemd` unit (`Type=notify`, `WatchdogSec=120`, `KillMode=control-group`) |
+| `tests/test_bridge.py` | Unit & integration test suite (18 tests) |
+| `tests/mock_telegram.py` & `tests/fake_agy.py` | Local mock Telegram Bot API (with fault injection & auto-click) + realistic stub `agy` CLI |
+| `tests/test_e2e_stress.py` | Tier 1 full-process E2E, 10-topic stress, chaos (`429`/`502`/`SIGTERM`/`SIGKILL`) suite |
+| `tests/test_e2e_live_agy.py` | Tier 2 opt-in (`RUN_LIVE_AGY_E2E=1`) automated E2E against real `agy` CLI & real hooks |
 
 ---
 

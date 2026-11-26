@@ -20,7 +20,7 @@ from unittest import mock
 
 from server.agy_runner import AgyResult, AgyRunner, build_scrubbed_env, format_channel_envelope
 from server.alpha_ssh import select_binding
-from server.bot import start_ipc_server
+from server.bot import sd_notify, start_ipc_server
 from server.config import BridgeConfig, ensure_ipc_token
 from server.db import BridgeStore
 from server.router import BridgeRouter, InboundMessage
@@ -836,6 +836,29 @@ class BridgeTestCase(unittest.TestCase):
         )
         self.assertEqual(proc_bridge.returncode, 0)
         self.assertEqual(json.loads(proc_bridge.stdout)["decision"], "deny")
+
+    def test_sd_notify_datagrams_and_unset_noop(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_SOCKET", None)
+            self.assertFalse(sd_notify("READY=1"))
+
+        import socket as _socket
+
+        if not hasattr(_socket, "AF_UNIX"):
+            return
+        sock_path = self.root / "notify.sock"
+        srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)
+        try:
+            srv.bind(str(sock_path))
+            srv.settimeout(2.0)
+            with mock.patch.dict(os.environ, {"NOTIFY_SOCKET": str(sock_path)}):
+                self.assertTrue(sd_notify("READY=1"))
+                self.assertTrue(sd_notify("WATCHDOG=1"))
+                self.assertTrue(sd_notify("STOPPING=1"))
+            got = [srv.recv(64).decode("utf-8") for _ in range(3)]
+            self.assertEqual(got, ["READY=1", "WATCHDOG=1", "STOPPING=1"])
+        finally:
+            srv.close()
 
 
 if __name__ == "__main__":

@@ -862,9 +862,11 @@ class BridgeRouter:
 
         sent = 0
         pending_user: str | None = None
+        last_user_from_bridge = False
         for idx, step in enumerate(new_steps):
             if step.step_type == "USER_INPUT":
-                pending_user = strip_bridge_header(step.text)
+                last_user_from_bridge = step.text.lstrip().startswith("[channel:")
+                pending_user = None if last_user_from_bridge else strip_bridge_header(step.text)
             elif step.step_type == "PLANNER_RESPONSE":
                 next_is_planner = (
                     idx + 1 < len(new_steps)
@@ -873,7 +875,7 @@ class BridgeRouter:
                 if next_is_planner:
                     continue
 
-                if binding.mirror_mode == "full" and pending_user:
+                if not last_user_from_bridge and binding.mirror_mode == "full" and pending_user:
                     snippet = pending_user.replace("\n", " ").strip()
                     cap = max(20, self.config.ssh_prompt_preview_chars)
                     if len(snippet) > cap:
@@ -886,7 +888,11 @@ class BridgeRouter:
                     )
                     sent += 1
 
-                prefix = "[SSH] " if binding.mirror_mode == "replies_only" else ""
+                prefix = (
+                    "[SSH] "
+                    if (not last_user_from_bridge and binding.mirror_mode == "replies_only")
+                    else ""
+                )
                 self.telegram.send_text_or_markdown_file(
                     binding.chat_id,
                     step.text,
@@ -900,14 +906,56 @@ class BridgeRouter:
                 self.store.log_message(
                     binding.id,
                     direction="mirror",
-                    origin="ssh",
+                    origin="startup_recovery" if last_user_from_bridge else "ssh",
                     agy_step_index=step.step_index,
                     content_preview=step.text,
                 )
                 sent += 1
                 pending_user = None
+                last_user_from_bridge = False
 
         return sent
+
+    def recover_after_startup(self, *, unclean_exit: bool) -> int:
+        """Reconcile finished-but-undelivered transcript steps and notify primary DM on unclean restart."""
+        reconciled = 0
+        for binding in self.store.list_active_bindings():
+            if not binding.agy_conversation_id:
+                continue
+            try:
+                reconciled += self.mirror_external_turns(binding.agy_conversation_id)
+            except Exception:
+                log.exception(
+                    "Startup transcript reconciliation failed for binding=%s", binding.id
+                )
+
+        if unclean_exit:
+            log.warning(
+                "Detected previous unclean shutdown (reconciled_messages=%d)", reconciled
+            )
+            if self.telegram.configured:
+                primary = self.store.get_primary_dm_binding("telegram")
+                if primary is not None:
+                    if reconciled > 0:
+                        notice = (
+                            f"[System] Bridge recovered from an unexpected restart and "
+                            f"delivered {reconciled} pending message(s)."
+                        )
+                    else:
+                        notice = (
+                            "[System] Bridge recovered from an unexpected restart. "
+                            "If a message was in flight when it exited, please re-send it."
+                        )
+                    try:
+                        self.telegram.send_message(
+                            primary.chat_id,
+                            notice,
+                            thread_id=primary.thread_id,
+                            disable_notification=True,
+                        )
+                    except Exception:
+                        log.exception("Failed sending unclean-restart notice to primary DM")
+        return reconciled
 
     def handle_watcher_event(self, payload: dict) -> dict:
         """Route a proactive watcher event through Alpha in the primary DM binding."""

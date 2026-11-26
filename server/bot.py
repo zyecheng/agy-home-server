@@ -9,7 +9,9 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import signal
+import socket
 import sys
 import threading
 import urllib.error
@@ -29,6 +31,23 @@ logging.basicConfig(
 log = logging.getLogger("agy-bridge.main")
 
 MAX_IPC_BODY_BYTES = 1_048_576  # 1 MiB
+
+
+def sd_notify(state: str) -> bool:
+    """Send a systemd sd_notify datagram (READY=1, WATCHDOG=1, STOPPING=1) using stdlib only."""
+    addr = os.environ.get("NOTIFY_SOCKET", "").strip()
+    if not addr or not hasattr(socket, "AF_UNIX"):
+        return False
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1.0)
+            sock.sendto(state.encode("utf-8"), addr)
+        return True
+    except OSError as exc:
+        log.debug("sd_notify(%s) skipped: %s", state, exc)
+        return False
 
 
 def start_ipc_server(
@@ -116,7 +135,12 @@ def start_ipc_server(
 
 
 def main() -> int:
-    env_file = Path(__file__).resolve().parent.parent / ".env"
+    env_override = os.environ.get("BRIDGE_ENV_FILE")
+    env_file: Path | None
+    if env_override is not None:
+        env_file = Path(env_override) if env_override.strip() else None
+    else:
+        env_file = Path(__file__).resolve().parent.parent / ".env"
     config = BridgeConfig.from_env(env_file)
     ipc_token = ensure_ipc_token(config.ipc_token_path)
     store = BridgeStore(config.db_path)
@@ -124,11 +148,17 @@ def main() -> int:
     telegram = TelegramClient(
         config.telegram_bot_token,
         max_inline_chars=config.max_inline_chars,
+        api_base_url=config.telegram_api_base_url,
     )
-    router = BridgeRouter(config, store, runner, telegram)
-    ipc = start_ipc_server(config, router, ipc_token)
-
+    router = BridgeRouter(
+        config,
+        store,
+        runner,
+        telegram,
+        approval_timeout_seconds=config.approval_timeout_seconds,
+    )
     stop_event = threading.Event()
+    clean_exit = False
 
     def _handle_sig(_signum, _frame) -> None:
         log.info("Shutting down agy-bridge...")
@@ -137,7 +167,20 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sig)
     signal.signal(signal.SIGINT, _handle_sig)
 
+    ipc = start_ipc_server(config, router, ipc_token)
+
     try:
+        # Track unclean restarts via kv_state and reconcile any finished-but-undelivered turns
+        prev_clean = store.get_kv("clean_shutdown", "")
+        unclean_exit = prev_clean == "0"
+        store.set_kv("clean_shutdown", "0")
+        try:
+            router.recover_after_startup(unclean_exit=unclean_exit)
+        except Exception:
+            log.exception("Startup recovery failed; continuing daemon startup")
+
+        sd_notify("READY=1")
+
         if not telegram.configured:
             log.info(
                 "TELEGRAM_BOT_TOKEN not configured yet; IPC server is active on %s:%d, Telegram polling in standby.",
@@ -145,7 +188,9 @@ def main() -> int:
                 config.ipc_port,
             )
             while not stop_event.is_set():
+                sd_notify("WATCHDOG=1")
                 stop_event.wait(5.0)
+            clean_exit = True
             return 0
 
         offset = int(store.get_kv("telegram_offset", "0") or "0")
@@ -156,13 +201,17 @@ def main() -> int:
             config.max_inline_chars,
         )
         while not stop_event.is_set():
+            sd_notify("WATCHDOG=1")
             try:
                 updates = telegram.get_updates(
                     offset=offset, timeout=config.poll_timeout_seconds
                 )
                 for upd in updates:
                     upd_id = int(upd["update_id"])
-                    offset = max(offset, upd_id + 1)
+                    if upd_id < offset:
+                        log.debug("Skipping duplicate/stale update_id=%d (offset=%d)", upd_id, offset)
+                        continue
+                    offset = upd_id + 1
                     store.set_kv("telegram_offset", str(offset))
                     try:
                         router.handle_telegram_update(upd)
@@ -174,11 +223,18 @@ def main() -> int:
             except Exception:
                 log.exception("Unexpected error in Telegram polling loop")
                 stop_event.wait(5.0)
+        clean_exit = True
     finally:
+        sd_notify("STOPPING=1")
         router.approvals.cancel_all()
         ipc.shutdown()
         ipc.server_close()
         router.shutdown(timeout_seconds=35.0)
+        if clean_exit:
+            try:
+                store.set_kv("clean_shutdown", "1")
+            except Exception:
+                log.debug("Could not persist clean_shutdown flag")
         store.close()
     return 0
 
