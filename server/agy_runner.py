@@ -21,6 +21,7 @@ class AgyResult:
     status: str
     response: str
     error: str = ""
+    stderr: str = ""
     duration_seconds: float = 0.0
     num_turns: int = 0
 
@@ -107,6 +108,7 @@ class AgyRunner:
                 status="ERROR",
                 response="",
                 error=stderr or f"agy exited with code {proc.returncode} and empty stdout",
+                stderr=stderr,
             )
 
         # Parse the last JSON line in case any diagnostic line preceded it
@@ -127,6 +129,7 @@ class AgyRunner:
                 status="ERROR",
                 response="",
                 error=f"Non-JSON agy output (rc={proc.returncode}): {stdout[:400]} | {stderr[:400]}",
+                stderr=stderr,
             )
 
         return AgyResult(
@@ -134,6 +137,7 @@ class AgyRunner:
             status=str(payload.get("status") or ("SUCCESS" if proc.returncode == 0 else "ERROR")),
             response=str(payload.get("response") or "").strip(),
             error=str(payload.get("error") or (stderr if proc.returncode != 0 else "")).strip(),
+            stderr=stderr,
             duration_seconds=float(payload.get("duration_seconds") or 0.0),
             num_turns=int(payload.get("num_turns") or 0),
         )

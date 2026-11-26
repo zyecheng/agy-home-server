@@ -65,12 +65,16 @@ class FakeTelegram(TelegramClient):
 
 
 class FakeRunner:
-    def __init__(self, responses: list[AgyResult]) -> None:
+    def __init__(self, responses: list[AgyResult], on_call=None) -> None:
         self.responses = list(responses)
+        self.on_call = on_call
         self.calls: list[dict] = []
 
     def run_prompt(self, prompt: str, *, conversation_id=None, workspace_dir=None, **kwargs) -> AgyResult:
+        idx = len(self.calls)
         self.calls.append({"prompt": prompt, "conversation_id": conversation_id, "cwd": workspace_dir})
+        if self.on_call is not None:
+            self.on_call(idx)
         return self.responses.pop(0)
 
     def run_cli_slash(self, slash_cmd: str, *, conversation_id=None, workspace_dir=None):
@@ -213,6 +217,119 @@ class BridgeTestCase(unittest.TestCase):
         )
         preview = build_two_line_preview("Line 1\n\nLine 2\nLine 3\n" + "a" * 4000)
         self.assertTrue(preview.startswith("Line 1\nLine 2"))
+
+    def test_empty_success_permission_denied_triggers_alpha_recovery(self) -> None:
+        conv_id = "conv-perm-denied"
+        b = self.store.get_or_create_binding("telegram", "111", 0, "private", str(self.workspace))
+        self.store.set_conversation_id(b.id, conv_id)
+        self.store.update_watermark(b.id, 1)
+
+        base_steps = [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "<USER_REQUEST>\nhi\n</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "hi"},
+        ]
+        self._write_transcript(conv_id, base_steps)
+
+        def append_failed_steps(call_idx: int) -> None:
+            if call_idx == 0:
+                self._write_transcript(
+                    conv_id,
+                    base_steps
+                    + [
+                        {
+                            "step_index": 4,
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "uptime && free -h"}}],
+                        },
+                        {
+                            "step_index": 5,
+                            "type": "GENERIC",
+                            "status": "ERROR",
+                            "error": 'permission check failed for unsandboxed "uptime && free -h": user denied permission to run command',
+                        },
+                    ],
+                )
+
+        # First call mimics real agy bug (status=SUCCESS, empty response); second call is Alpha's no-tool recovery reply
+        runner = FakeRunner(
+            [
+                AgyResult(conversation_id=conv_id, status="SUCCESS", response=""),
+                AgyResult(
+                    conversation_id=conv_id,
+                    status="SUCCESS",
+                    response="刚才查系统资源的命令在无头模式下被权限拦截了，你可以先发 /status 或在 settings.json 放开权限。",
+                ),
+            ],
+            on_call=append_failed_steps,
+        )
+        router = BridgeRouter(self.cfg, self.store, runner, self.tg)  # type: ignore[arg-type]
+        router._process_batch([InboundMessage("telegram", "111", 0, "private", 111, "u", "20", "你能查一下系统资源吗")])
+
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("permission_denied", runner.calls[1]["prompt"])
+        self.assertIn("uptime && free -h", runner.calls[1]["prompt"])
+        self.assertEqual(len(self.tg.sent_messages), 1)
+        sent_text = self.tg.sent_messages[0]["text"]
+        self.assertNotIn("agy error (SUCCESS)", sent_text)
+        self.assertIn("权限拦截", sent_text)
+        self.assertIn("[permission_denied | step 5]", sent_text)
+
+    def test_auth_error_skips_recovery_and_uses_fallback_report(self) -> None:
+        runner = FakeRunner(
+            [
+                AgyResult(
+                    conversation_id="",
+                    status="ERROR",
+                    response="",
+                    error="authentication required: You are not logged into Antigravity.",
+                )
+            ]
+        )
+        router = BridgeRouter(self.cfg, self.store, runner, self.tg)  # type: ignore[arg-type]
+        router._process_batch([InboundMessage("telegram", "111", 0, "private", 111, "u", "21", "hello")])
+
+        # Must NOT call agy a second time on auth failure
+        self.assertEqual(len(runner.calls), 1)
+        sent_text = self.tg.sent_messages[0]["text"]
+        self.assertIn("auth_required", sent_text)
+        self.assertIn("ssh agy-staging", sent_text)
+
+    def test_failed_recovery_falls_back_to_deterministic_report(self) -> None:
+        conv_id = "conv-rec-fail"
+        b = self.store.get_or_create_binding("telegram", "111", 0, "private", str(self.workspace))
+        self.store.set_conversation_id(b.id, conv_id)
+        self.store.update_watermark(b.id, 1)
+
+        def append_err(call_idx: int) -> None:
+            if call_idx == 0:
+                self._write_transcript(
+                    conv_id,
+                    [
+                        {
+                            "step_index": 2,
+                            "type": "GENERIC",
+                            "status": "ERROR",
+                            "error": 'permission check failed for unsandboxed "df -h": user denied permission',
+                        }
+                    ],
+                )
+
+        runner = FakeRunner(
+            [
+                AgyResult(conversation_id=conv_id, status="SUCCESS", response=""),
+                AgyResult(conversation_id=conv_id, status="ERROR", response="", error="secondary crash"),
+            ],
+            on_call=append_err,
+        )
+        router = BridgeRouter(self.cfg, self.store, runner, self.tg)  # type: ignore[arg-type]
+        router._process_batch([InboundMessage("telegram", "111", 0, "private", 111, "u", "22", "check disk")])
+
+        self.assertEqual(len(runner.calls), 2)
+        sent_text = self.tg.sent_messages[0]["text"]
+        self.assertIn("permission_denied", sent_text)
+        self.assertIn("df -h", sent_text)
+        self.assertNotIn("agy error (SUCCESS)", sent_text)
 
 
 if __name__ == "__main__":

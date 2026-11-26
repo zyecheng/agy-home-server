@@ -13,6 +13,11 @@ from pathlib import Path
 from .agy_runner import AgyRunner, format_channel_envelope
 from .config import BridgeConfig
 from .db import VALID_MIRROR_MODES, Binding, BridgeStore
+from .failure_analyzer import (
+    analyze_turn_failure,
+    build_recovery_prompt,
+    format_fallback_report,
+)
 from .telegram_client import TelegramClient
 from .transcript import (
     get_latest_step_index,
@@ -263,7 +268,14 @@ class BridgeRouter:
             typing_thread.start()
 
             conv_id = binding.agy_conversation_id
+            pre_turn_step = binding.last_mirrored_step
             if conv_id:
+                tpath_before = resolve_transcript_file(
+                    brain_dir=self.config.agy_brain_dir,
+                    conversation_id=conv_id,
+                )
+                if tpath_before is not None:
+                    pre_turn_step = max(pre_turn_step, get_latest_step_index(tpath_before))
                 with self._state_guard:
                     self._bridge_in_flight.add(conv_id)
 
@@ -277,7 +289,7 @@ class BridgeRouter:
                 log.exception("agy runner crashed for binding %s", binding.id)
                 self.telegram.send_message(
                     binding.chat_id,
-                    f"Agent execution failed: {exc}",
+                    f"Agent execution crashed before returning: {exc}",
                     thread_id=binding.thread_id,
                 )
                 return
@@ -292,26 +304,29 @@ class BridgeRouter:
                 self.store.set_conversation_id(binding.id, final_conv_id)
                 binding.agy_conversation_id = final_conv_id
 
-            # Advance watermark to current transcript tip so Stop hook won't re-mirror this turn
-            if final_conv_id:
-                tpath = resolve_transcript_file(
-                    brain_dir=self.config.agy_brain_dir,
-                    conversation_id=final_conv_id,
-                )
-                if tpath is not None:
-                    latest_step = get_latest_step_index(tpath)
-                    if latest_step >= 0:
-                        self.store.update_watermark(binding.id, latest_step)
-
             if result.status != "SUCCESS" or not result.response:
-                err = result.error or f"status={result.status}"
-                self.telegram.send_message(
+                reply_text = self._recover_failed_turn(
+                    binding=binding,
+                    user_message=combined_text,
+                    result=result,
+                    conv_id=final_conv_id,
+                    pre_turn_step=pre_turn_step,
+                )
+                self._advance_watermark(binding.id, final_conv_id)
+                self.telegram.send_text_or_markdown_file(
                     binding.chat_id,
-                    f"agy error ({result.status}): {err[:1200]}",
+                    reply_text,
                     thread_id=binding.thread_id,
+                )
+                self.store.log_message(
+                    binding.id,
+                    direction="out",
+                    origin="bridge_recovery",
+                    content_preview=reply_text,
                 )
                 return
 
+            self._advance_watermark(binding.id, final_conv_id)
             self.telegram.send_text_or_markdown_file(
                 binding.chat_id,
                 result.response,
@@ -323,6 +338,70 @@ class BridgeRouter:
                 origin="bridge",
                 content_preview=result.response,
             )
+
+    def _advance_watermark(self, binding_id: int, conv_id: str | None) -> None:
+        if not conv_id:
+            return
+        tpath = resolve_transcript_file(
+            brain_dir=self.config.agy_brain_dir,
+            conversation_id=conv_id,
+        )
+        if tpath is not None:
+            latest_step = get_latest_step_index(tpath)
+            if latest_step >= 0:
+                self.store.update_watermark(binding_id, latest_step)
+
+    def _recover_failed_turn(
+        self,
+        *,
+        binding: Binding,
+        user_message: str,
+        result,
+        conv_id: str | None,
+        pre_turn_step: int,
+    ) -> str:
+        """Analyze an abrupt/empty turn and let Alpha explain it once (with deterministic fallback)."""
+        diag = analyze_turn_failure(
+            result,
+            brain_dir=self.config.agy_brain_dir,
+            conversation_id=conv_id,
+            pre_turn_step_index=pre_turn_step,
+        )
+        log.warning(
+            "Turn failed/empty on binding=%s conv=%s category=%s tools=%s",
+            binding.id,
+            conv_id,
+            diag.category,
+            diag.attempted_tools,
+        )
+
+        if diag.recoverable_via_agent:
+            recovery_prompt = build_recovery_prompt(
+                user_message, diag, tz_label=self.config.timezone_label
+            )
+            if conv_id:
+                with self._state_guard:
+                    self._bridge_in_flight.add(conv_id)
+            try:
+                rec = self.runner.run_prompt(
+                    recovery_prompt,
+                    conversation_id=conv_id,
+                    workspace_dir=Path(binding.workspace_dir),
+                )
+                if rec.status == "SUCCESS" and rec.response:
+                    tag = f"[{diag.category}"
+                    if diag.failed_step_index is not None:
+                        tag += f" | step {diag.failed_step_index}"
+                    tag += "]"
+                    return f"{rec.response}\n\n{tag}"
+            except Exception:
+                log.exception("Recovery turn failed for binding=%s", binding.id)
+            finally:
+                if conv_id:
+                    with self._state_guard:
+                        self._bridge_in_flight.discard(conv_id)
+
+        return format_fallback_report(diag, conversation_id=conv_id)
 
     def _typing_loop(self, chat_id: str, thread_id: int, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
