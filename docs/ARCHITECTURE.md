@@ -32,12 +32,13 @@ flowchart LR
     end
 
     subgraph Server["Ubuntu 24.04 Server (agy-staging / HP Elite 600 G9)"]
-        subgraph Bridge["agy-telegram.service (Python 3.12, systemd hardened)"]
-            POLL["Telegram Long-Poller\n(getUpdates)"]
-            ROUTER["BridgeRouter\n(Debounce + Endpoint Lock + Commands)"]
-            IPC["Auth Localhost HTTP IPC\n127.0.0.1:8765 (X-Bridge-Token)\n(/health, /hook, /watcher)"]
+        subgraph Bridge["agy-telegram.service (Python 3.12, systemd Type=notify + hardened)"]
+            POLL["Telegram Long-Poller\n(getUpdates: message + callback_query\n+ sd_notify WATCHDOG=1)"]
+            ROUTER["BridgeRouter\n(Debounce + Endpoint Lock + Commands\n+ Startup Reconciliation)"]
+            APPROVE["ApprovalManager\n(Lock-Free, Single-Use Nonce, 120s Fail-Closed)"]
+            IPC["Auth Localhost HTTP IPC\n127.0.0.1:8765 (X-Bridge-Token)\n(/health, /hook, /approve, /watcher)"]
             FAIL["Failure Analyzer\n(Stage 1 Evidence + Stage 2 Recovery)"]
-            TGC["TelegramClient\n(Retry/429, Inline <=3500c / .md >3500c)"]
+            TGC["TelegramClient\n(Retry/429, Inline <=3500c / .md >3500c\n+ Inline Keyboards & Callbacks)"]
         end
 
         DB[("SQLite WAL (0600)\n~/agy-server/data/bridge.db")]
@@ -45,7 +46,7 @@ flowchart LR
         subgraph AGY["Antigravity CLI Runtime (~/alpha-assistant/)"]
             CLI["agy -p --conversation &lt;id&gt;\n(Scrubbed env, --output-format json)"]
             GEMINI["GEMINI.md (RO)\n(Alpha Bilingual Persona)"]
-            HOOKS[".agents/hooks.json (RO)\n(PreInvocation + Stop)"]
+            HOOKS[".agents/hooks.json (RO)\n(PreInvocation + Stop + PreToolUse)"]
             LOG[("transcript_full.jsonl\n&amp; transcript.jsonl")]
         end
     end
@@ -54,6 +55,8 @@ flowchart LR
     TG_SG <-->|HTTPS Long-Poll / Bot API| POLL
     POLL --> ROUTER
     ROUTER <--> DB
+    ROUTER --> APPROVE
+    APPROVE --> TGC
     ROUTER --> CLI
     CLI --- GEMINI
     CLI --> LOG
@@ -62,11 +65,12 @@ flowchart LR
     FAIL --> LOG
     FAIL --> CLI
     ROUTER --> TGC
-    TGC -->|sendMessage / sendDocument| TG_DM
-    TGC -->|sendMessage / sendDocument| TG_SG
+    TGC -->|sendMessage / sendDocument / editMessageText| TG_DM
+    TGC -->|sendMessage / sendDocument / editMessageText| TG_SG
 
     SSH -->|agy --conversation &lt;id&gt;| CLI
     HOOKS -->|hook_notify.py POST /hook| IPC
+    HOOKS -->|hook_approve.py POST /approve| IPC
     IPC --> ROUTER
     WATCH -->|POST /watcher + X-Bridge-Token| IPC
 ```
@@ -82,7 +86,7 @@ To keep personal Alpha interactions isolated from plain engineering/admin work a
 ├── alpha-assistant/                 # Dedicated Alpha workspace (CWD for bridge & alpha-ssh)
 │   ├── GEMINI.md                    # Read-only to systemd service; Alpha bilingual persona
 │   ├── .agents/
-│   │   └── hooks.json               # Read-only to systemd service; PreInvocation + Stop hooks
+│   │   └── hooks.json               # Read-only to systemd service; PreInvocation + Stop + PreToolUse hooks
 │   ├── memory/                      # (Reserved) USER.md / MEMORY.md / STATE.md
 │   └── inbox/                       # (Reserved) Staged multimodal attachments per conv_id
 ├── agy-server/                      # Read-only to systemd service (except data/)
@@ -128,7 +132,7 @@ To keep personal Alpha interactions isolated from plain engineering/admin work a
   - `active` (`1` = current binding; `0` = archived via `/reset`, preserving old transcripts on disk)
   - Partial unique index on `(channel, chat_id, thread_id) WHERE active = 1`
 - **`message_log`**: Local audit log (`direction`, `origin`, `external_message_id`, `agy_step_index`, `content_preview`, `attachments_json`).
-- **`kv_state`**: Persists `telegram_offset` across restarts. On `SIGTERM`, `router.shutdown()` flushes pending debounce batches and joins active workers before closing SQLite (`TimeoutStopSec=45`).
+- **`kv_state`**: Persists `telegram_offset` (enforced strictly monotonically via `if upd_id < offset: continue` to drop duplicate batch updates) and `clean_shutdown` (`"1"` written on graceful `SIGTERM`/`SIGINT`, `"0"` while running so unclean exits trigger startup recovery). Signal handlers are registered before IPC startup and recovery so even a `SIGTERM` during boot drains cleanly (`TimeoutStopSec=45`).
 - `alpha-ssh` opens `bridge.db` in SQLite read-only URI mode (`?mode=ro`) to avoid running DDL against the live daemon database.
 
 ---
@@ -144,7 +148,7 @@ To keep personal Alpha interactions isolated from plain engineering/admin work a
 3. **Debounce Coalescing:** Normal messages wait `DEBOUNCE_SECONDS` (`1.5s`) per `(channel, chat_id, thread_id)` using monotonic generation counters so superseded timers never steal or orphan newer batches.
 4. **SSH Busy Wait + Endpoint Lock:** Waits for any active SSH turn **outside** the endpoint lock (preventing deadlocks with `Stop` hook mirroring), then acquires the lock keyed by `(channel, chat_id, thread_id)` and reconciles any un-mirrored SSH/offline steps before executing.
 5. **Continuous Typing Indicator:** Sends `sendChatAction(typing)` every 4s across both the primary `agy -p` call **and** any failure-recovery turn.
-6. **Headless Execution (`server/agy_runner.py`):** Runs `agy -p "<envelope>" [--conversation <id>] --output-format json --disable-slash-commands` in `~/alpha-assistant/` with a scrubbed environment (`TELEGRAM_*` and `BRIDGE_IPC_*` stripped, `AGY_BRIDGE_ORIGIN=bridge` set).
+6. **Headless Execution (`server/agy_runner.py`):** Runs `agy -p "<envelope>" [--conversation <id>] --output-format json --disable-slash-commands` in `~/alpha-assistant/` with a scrubbed environment (`TELEGRAM_*` and `BRIDGE_IPC_*` stripped; `AGY_BRIDGE_ORIGIN=bridge` and non-secret `AGY_BRIDGE_BINDING_ID=<binding.id>` set so Turn-1 `PreToolUse` hooks can resolve the target chat/topic before `agy_conversation_id` is saved).
    - Timestamps use Python stdlib `ZoneInfo(BRIDGE_TIMEZONE)` (automatic PST/PDT). Envelope header values strip brackets and newlines to prevent header spoofing.
    - `subprocess.TimeoutExpired` is caught and returned as `AgyResult(status="TIMEOUT")` into the failure analyzer; `AGY_TIMEOUT_SECONDS=0` disables the subprocess timeout (`None`).
 7. **Delivery (`server/telegram_client.py`):**
@@ -187,10 +191,44 @@ sequenceDiagram
 - **Path Containment (`server/transcript.py`):** Rejects unsafe `conversation_id` values and validates any caller-supplied `transcriptPath` via canonical `Path.resolve().is_relative_to(brain_dir/<conv_id>/.system_generated/logs)`.
 - **`hook_notify.py`:** Loads fallback IPC host/port/token from `~/agy-server/.env` and `data/ipc.token`, ignores `AGY_BRIDGE_ORIGIN=bridge`, and always emits valid non-blocking hook JSON on stdout.
 
-### 5.3 Two-Stage Failure Analysis & Alpha Recovery (`server/failure_analyzer.py`)
+### 5.3 Interactive Telegram Tool Approvals (`PreToolUse` Hook)
+
+```mermaid
+sequenceDiagram
+    participant AGY as agy -p (Headless Bridge Turn)
+    participant Hook as hook_approve.py (PreToolUse)
+    participant Bridge as agy-telegram.service (/approve + ApprovalManager)
+    participant TG as User on Telegram
+
+    AGY->>Hook: PreToolUse stdin JSON {conversationId, toolCall}
+    Note over Hook: If AGY_BRIDGE_ORIGIN != "bridge" (SSH), immediately return {"decision":"allow"}
+    Hook->>Bridge: POST /approve + X-Bridge-Token {conversationId, bindingId, toolCall}
+    Note over Bridge: Lock-free (never takes endpoint lock -> no deadlock with in-flight turn)
+    Bridge->>TG: sendMessage: command summary + [Approve] (ap:<nonce>) / [Deny] (dn:<nonce>)
+    alt User taps Approve within 120s (authorized user_id + matching chat_id, not bot)
+        TG->>Bridge: getUpdates callback_query (ap:<nonce>)
+        Bridge->>TG: answerCallbackQuery + editMessageText ("Approved via Telegram", buttons cleared)
+        Bridge-->>Hook: 200 {"decision": "auto_approve"}
+        Hook-->>AGY: stdout {"decision": "auto_approve"}
+    else User taps Deny, 120s timeout, IPC error, or SIGTERM/SIGKILL
+        Bridge->>TG: editMessageText ("Denied" / "Timed out — auto-denied", buttons cleared)
+        Bridge-->>Hook: 200 {"decision": "deny"} (or socket closes -> fail-closed)
+        Hook-->>AGY: stdout {"decision": "deny"}
+    end
+```
+
+- **Matched tools (`alpha-workspace/.agents/hooks.json`):** `run_command|write_to_file|replace_file_content|multi_replace_file_content|write_file|edit_file|read_url_content` (`timeout: 130s`; approval TTL `120s`, configurable via `APPROVAL_TIMEOUT_SECONDS`).
+- **Security invariants:** Single-use 24-hex cryptographic nonce (`ap:<nonce>` / `dn:<nonce>`), tool/args SHA-256 display digest, server-side `user_id` + `is_bot=False` + `chat_id` verification (wrong-chat attempts cannot spoof-consume the owner's pending approval), `bindingId`/`conversationId` cross-check, and **strict fail-closed `deny`** on any missing token, IPC error, timeout, or daemon shutdown/crash.
+
+### 5.4 Two-Stage Failure Analysis & Alpha Recovery (`server/failure_analyzer.py`)
 1. **Stage 1 — Deterministic Evidence Extraction:** Inspects new `transcript_full.jsonl` steps (`tool_calls` and `status == "ERROR"`), `AgyResult.error`, and `AgyResult.stderr` via an ordered regex rule table (`permission_denied`, `auth_required`, `quota_or_rate_limit`, `timeout`, `tool_error`, `empty_response`).
 2. **Stage 2 — Guarded In-Conversation Alpha Explanation:** For recoverable categories *when a `conversation_id` already exists*, runs **one** bounded (`45s`) recovery prompt wrapping untrusted user/error text inside `<untrusted_data>` delimiters so Alpha explains the failure in the user's language (`[category | step N]`).
 3. **Deterministic Fallback:** Skips Stage 2 for `auth_required`, `quota_or_rate_limit`, or missing `conversation_id` (preventing orphan conversations), and falls back automatically to Stage 1's clean report if Stage 2 fails.
+
+### 5.5 Crash, Hang & Restart Recovery (`server/bot.py`, `server/router.py`)
+1. **Hang detection (`sd_notify`):** `systemd` supervises the service via `Type=notify`, `NotifyAccess=main`, and `WatchdogSec=120`. `bot.py` emits `READY=1` after IPC & startup recovery, `WATCHDOG=1` on every polling iteration (~30s), and `STOPPING=1` on shutdown via stdlib `AF_UNIX` `SOCK_DGRAM` to `$NOTIFY_SOCKET`.
+2. **Startup transcript reconciliation:** On every boot, `router.recover_after_startup()` scans active bindings for `step_index > last_mirrored_step`. Any finished-but-undelivered reply written before a crash (or SSH turn finished while down) is delivered automatically; Telegram-originated `[channel:` turns are delivered cleanly without a `[SSH]` prefix.
+3. **Unclean-exit alert:** `kv_state.clean_shutdown` is cleared to `"0"` on startup and set to `"1"` only on graceful `SIGTERM`/`SIGINT` exit. If startup observes `"0"` (e.g., after `SIGKILL`, OOM kill, or power loss), the bridge sends a silent `[System] Bridge recovered from an unexpected restart...` notice to the primary DM. Clean restarts emit no alert.
 
 ---
 
@@ -209,7 +247,21 @@ sequenceDiagram
 
 ---
 
-## 7. Repository Map
+## 7. Automated Testing & Verification Strategy
+
+The bridge supports isolated full-process testing alongside a live staging daemon without touching production `.env`, `bridge.db`, port `8765`, or real Telegram chats:
+- **`TELEGRAM_API_BASE_URL` guardrail (`server/config.py`):** Defaults to `https://api.telegram.org` and strictly permits only `https://api.telegram.org` or loopback `http://127.0.0.1|localhost|[::1]` (rejects arbitrary hosts so bot tokens cannot be exfiltrated).
+- **`BRIDGE_ENV_FILE` isolation:** Allows test harnesses to supply a non-secret temp `.env` (ephemeral IPC port, temp DB, temp IPC token path) while keeping `TELEGRAM_*` / `BRIDGE_IPC_*` stripped from `agy` child processes.
+
+| Tier | Command (on `agy-staging`) | Scope & Guarantees |
+| --- | --- | --- |
+| **Unit & Integration** (`tests/test_bridge.py`, 18 tests) | `python3 -m unittest discover -s tests -v` | Routing, debounce, SQLite WAL, fail-closed auth, IPC token/CSRF, transcript containment, failure recovery, approval nonces/spoofing, `sd_notify` datagrams. |
+| **Tier 1: Full-Process E2E, Stress & Chaos** (`tests/test_e2e_stress.py`, 4 suites) | Included in `unittest discover` (0 LLM quota, ~38s) | Spawns real `python3 -m server.bot` against `MockTelegramServer` + realistic `tests/fake_agy.py` (which invokes real `hook_approve.py` & `hook_notify.py`):<br>• Full lifecycle (Turn-1 `bindingId` approve, deny + recovery, `>3500`-char UTF-8 `.md` multipart upload, SSH mirror, commands, secret-leak guard)<br>• 10-topic parallel burst stress (70+ turns, RSS & FD bounds, `PRAGMA integrity_check`)<br>• Fault injection (`429` retry, `502`/socket drop, duplicate `update_id`, `0.8s` timeout, mid-approval `SIGTERM` restart)<br>• `SIGKILL` (`kill -9`) crash recovery + stranded reply delivery + `READY=1`/`WATCHDOG=1`/`STOPPING=1` verification. |
+| **Tier 2: Real `agy` Automated E2E** (`tests/test_e2e_live_agy.py`, opt-in) | `RUN_LIVE_AGY_E2E=1 python3 -m unittest tests/test_e2e_live_agy.py -v` | Runs real `bot.py` + real `agy` CLI + real `hooks.json` against local `MockTelegramServer` (auto-clicks `[Approve]` and `[Deny]`, verifies real `run_command` execution/denial and real SSH `Stop` hook mirroring; ~50s, ~4 small LLM turns). |
+
+---
+
+## 8. Repository Map
 
 | Path | Responsibility |
 | --- | --- |
@@ -241,7 +293,7 @@ sequenceDiagram
 
 ---
 
-## 8. Security Contracts & Planned Next Milestones
+## 9. Security Contracts & Planned Next Milestones
 
 1. **Headless Tool Permissions & Timezone (immediate):**
    - Set VM timezone to `America/Los_Angeles` and configure `~/.gemini/antigravity-cli/settings.json` with least-privilege allowlists (or `always-proceed` **only** in tandem with the `systemd` isolation above + `PreToolUse` approval gates below — never relying on command denylists alone).
