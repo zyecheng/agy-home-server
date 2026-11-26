@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 param(
     [string]$TargetHost = "agy-staging",
     [string]$RemoteDir = "~/agy-server"

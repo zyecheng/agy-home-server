@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 zyecheng | SPDX-License-Identifier: BSD-3-Clause -->
+
 # Alpha — Dedicated Workspace Persona (`GEMINI.md`)
 
 ## 一、最高原则（PRISM：事实与严谨永远高于人设）

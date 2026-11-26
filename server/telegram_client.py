@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Minimal stdlib Telegram Bot API client with >3500-char .md attachment support."""
 
 from __future__ import annotations

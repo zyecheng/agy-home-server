@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Configuration loader for the Antigravity home server bridge."""
 
 from __future__ import annotations

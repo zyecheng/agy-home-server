@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Safely update KEY=VALUE entries in ~/agy-server/.env from stdin (0600, never echoes secrets)."""
 
 from __future__ import annotations

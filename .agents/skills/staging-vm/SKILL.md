@@ -8,6 +8,9 @@ description: >-
   or managing VM snapshots (`clean-base`).
 ---
 
+<!-- Copyright (c) 2026 zyecheng | SPDX-License-Identifier: BSD-3-Clause -->
+
+
 # Staging VM Management (`agy-staging`)
 
 Use [vm.ps1](./scripts/vm.ps1) as the single entrypoint for managing the `agy-staging` VirtualBox VM on this Windows host.

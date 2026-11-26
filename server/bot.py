@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Main daemon: Telegram long-polling bridge + localhost Hook/Watcher IPC server."""
 
 from __future__ import annotations

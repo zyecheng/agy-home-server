@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """SQLite (WAL) store for channel <-> Antigravity conversation bindings."""
 
 from __future__ import annotations

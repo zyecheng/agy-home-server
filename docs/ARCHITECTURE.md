@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 zyecheng | SPDX-License-Identifier: BSD-3-Clause -->
+
 # Alpha 24/7 Home AI Server — Architecture & Design Document
 
 > **Status:** v1 Implemented & Verified on Staging VM (`agy-staging`)  

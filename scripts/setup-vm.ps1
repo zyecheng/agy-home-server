@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 param(
     [string]$VmName = "agy-staging",
     [string]$OvaPath = "C:\Users\zxzha\.gemini\antigravity\scratch\agy-home-server\vm\noble-server-cloudimg-amd64.ova",

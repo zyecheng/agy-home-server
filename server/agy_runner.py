@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Subprocess wrapper around headless Antigravity CLI (`agy -p`)."""
 
 from __future__ import annotations

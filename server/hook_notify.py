@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Antigravity PreInvocation / Stop hook bridge notifier.
 
 Reads hook JSON payload from stdin, forwards it to the local agy-bridge IPC

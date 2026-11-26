@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 zyecheng | SPDX-License-Identifier: BSD-3-Clause -->
+
 # Antigravity 24/7 Home AI Server (`agy-home-server`)
 
 Staging (VirtualBox Ubuntu 24.04 LTS) and deployment scaffolding for a 24/7 home AI server (HP Elite 600 G9 Mini PC) with a Telegram bridge + `systemd` services.

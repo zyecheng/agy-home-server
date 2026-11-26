@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Core channel-agnostic router, debouncer, and SSH transcript mirror."""
 
 from __future__ import annotations

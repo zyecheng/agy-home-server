@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Unit and integration tests for SQLite router, transcript parser, .md upload, and SSH mirroring."""
 
 from __future__ import annotations

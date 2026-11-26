@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 param(
     [Parameter(Mandatory = $true, Position = 0)]
     [ValidateSet("start", "stop", "status", "deploy", "logs", "snapshot", "restore")]

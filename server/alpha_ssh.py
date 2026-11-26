@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Helper CLI to list mapped Telegram bindings and attach `agy --conversation` over SSH."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Failure diagnostics and Alpha recovery prompt builder for abrupt/empty agy turns."""
 
 from __future__ import annotations
