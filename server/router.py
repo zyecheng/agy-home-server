@@ -267,77 +267,79 @@ class BridgeRouter:
             )
             typing_thread.start()
 
-            conv_id = binding.agy_conversation_id
-            pre_turn_step = binding.last_mirrored_step
-            if conv_id:
-                tpath_before = resolve_transcript_file(
-                    brain_dir=self.config.agy_brain_dir,
-                    conversation_id=conv_id,
-                )
-                if tpath_before is not None:
-                    pre_turn_step = max(pre_turn_step, get_latest_step_index(tpath_before))
-                with self._state_guard:
-                    self._bridge_in_flight.add(conv_id)
-
             try:
-                result = self.runner.run_prompt(
-                    envelope,
-                    conversation_id=conv_id,
-                    workspace_dir=Path(binding.workspace_dir),
-                )
-            except Exception as exc:
-                log.exception("agy runner crashed for binding %s", binding.id)
-                self.telegram.send_message(
-                    binding.chat_id,
-                    f"Agent execution crashed before returning: {exc}",
-                    thread_id=binding.thread_id,
-                )
-                return
-            finally:
-                stop_typing.set()
+                conv_id = binding.agy_conversation_id
+                pre_turn_step = binding.last_mirrored_step
                 if conv_id:
+                    tpath_before = resolve_transcript_file(
+                        brain_dir=self.config.agy_brain_dir,
+                        conversation_id=conv_id,
+                    )
+                    if tpath_before is not None:
+                        pre_turn_step = max(pre_turn_step, get_latest_step_index(tpath_before))
                     with self._state_guard:
-                        self._bridge_in_flight.discard(conv_id)
+                        self._bridge_in_flight.add(conv_id)
 
-            final_conv_id = result.conversation_id or conv_id
-            if final_conv_id and final_conv_id != binding.agy_conversation_id:
-                self.store.set_conversation_id(binding.id, final_conv_id)
-                binding.agy_conversation_id = final_conv_id
+                try:
+                    result = self.runner.run_prompt(
+                        envelope,
+                        conversation_id=conv_id,
+                        workspace_dir=Path(binding.workspace_dir),
+                    )
+                except Exception as exc:
+                    log.exception("agy runner crashed for binding %s", binding.id)
+                    self.telegram.send_message(
+                        binding.chat_id,
+                        f"Agent execution crashed before returning: {exc}",
+                        thread_id=binding.thread_id,
+                    )
+                    return
+                finally:
+                    if conv_id:
+                        with self._state_guard:
+                            self._bridge_in_flight.discard(conv_id)
 
-            if result.status != "SUCCESS" or not result.response:
-                reply_text = self._recover_failed_turn(
-                    binding=binding,
-                    user_message=combined_text,
-                    result=result,
-                    conv_id=final_conv_id,
-                    pre_turn_step=pre_turn_step,
-                )
+                final_conv_id = result.conversation_id or conv_id
+                if final_conv_id and final_conv_id != binding.agy_conversation_id:
+                    self.store.set_conversation_id(binding.id, final_conv_id)
+                    binding.agy_conversation_id = final_conv_id
+
+                if result.status != "SUCCESS" or not result.response:
+                    reply_text = self._recover_failed_turn(
+                        binding=binding,
+                        user_message=combined_text,
+                        result=result,
+                        conv_id=final_conv_id,
+                        pre_turn_step=pre_turn_step,
+                    )
+                    self._advance_watermark(binding.id, final_conv_id)
+                    self.telegram.send_text_or_markdown_file(
+                        binding.chat_id,
+                        reply_text,
+                        thread_id=binding.thread_id,
+                    )
+                    self.store.log_message(
+                        binding.id,
+                        direction="out",
+                        origin="bridge_recovery",
+                        content_preview=reply_text,
+                    )
+                    return
+
                 self._advance_watermark(binding.id, final_conv_id)
                 self.telegram.send_text_or_markdown_file(
                     binding.chat_id,
-                    reply_text,
+                    result.response,
                     thread_id=binding.thread_id,
                 )
                 self.store.log_message(
                     binding.id,
                     direction="out",
-                    origin="bridge_recovery",
-                    content_preview=reply_text,
+                    origin="bridge",
+                    content_preview=result.response,
                 )
-                return
-
-            self._advance_watermark(binding.id, final_conv_id)
-            self.telegram.send_text_or_markdown_file(
-                binding.chat_id,
-                result.response,
-                thread_id=binding.thread_id,
-            )
-            self.store.log_message(
-                binding.id,
-                direction="out",
-                origin="bridge",
-                content_preview=result.response,
-            )
+            finally:
+                stop_typing.set()
 
     def _advance_watermark(self, binding_id: int, conv_id: str | None) -> None:
         if not conv_id:
