@@ -68,7 +68,17 @@ def _strip_envelope(prompt: str) -> str:
         lines = lines[1:]
     if lines and lines[0].startswith("[attachments:"):
         lines = lines[1:]
+    if lines and lines[0].startswith("[note:"):
+        lines = lines[1:]
     return "\n".join(lines).strip()
+
+
+def _extract_attachments(prompt: str) -> list[Path]:
+    for line in prompt.splitlines()[:4]:
+        if line.startswith("[attachments:") and line.endswith("]"):
+            inner = line[len("[attachments:") : -1].strip()
+            return [Path(p.strip()) for p in inner.split(",") if p.strip()]
+    return []
 
 
 def main() -> int:
@@ -195,7 +205,13 @@ def main() -> int:
             + ("这是一段用于测试超长 Markdown 附件上传的内容 — block.\n" * 120)
         )
     else:
-        reply = f"ECHO[{conv_id}]: {user_text}"
+        att_paths = _extract_attachments(prompt)
+        if att_paths:
+            total_bytes = sum(p.stat().st_size for p in att_paths if p.exists())
+            names = ",".join(p.name for p in att_paths if p.exists())
+            reply = f"ATTACHED_OK[{len(att_paths)}:{total_bytes}:{names}]: {user_text}"
+        else:
+            reply = f"ECHO[{conv_id}]: {user_text}"
 
     _append_steps(
         tpath,

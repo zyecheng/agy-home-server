@@ -158,6 +158,8 @@ class BridgeConfig:
     timezone_name: str
     telegram_api_base_url: str = DEFAULT_TELEGRAM_API_BASE_URL
     approval_timeout_seconds: float = 120.0
+    max_attachment_bytes: int = 15 * 1024 * 1024
+    inbox_retention_days: int = 7
 
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> "BridgeConfig":
@@ -194,6 +196,14 @@ class BridgeConfig:
         approval_timeout_seconds = max(
             0.05, _parse_float(get("APPROVAL_TIMEOUT_SECONDS", "120"), 120.0)
         )
+        max_attachment_bytes = max(
+            1024,
+            min(
+                20 * 1024 * 1024,
+                _parse_int(get("MAX_ATTACHMENT_BYTES", str(15 * 1024 * 1024)), 15 * 1024 * 1024),
+            ),
+        )
+        inbox_retention_days = max(0, _parse_int(get("INBOX_RETENTION_DAYS", "7"), 7))
 
         return cls(
             telegram_bot_token=get("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -222,4 +232,6 @@ class BridgeConfig:
             timezone_name=get("BRIDGE_TIMEZONE", "America/Los_Angeles").strip(),
             telegram_api_base_url=telegram_api_base_url,
             approval_timeout_seconds=approval_timeout_seconds,
+            max_attachment_bytes=max_attachment_bytes,
+            inbox_retention_days=inbox_retention_days,
         )

@@ -88,7 +88,7 @@ To keep personal Alpha interactions isolated from plain engineering/admin work a
 │   ├── .agents/
 │   │   └── hooks.json               # Read-only to systemd service; PreInvocation + Stop + PreToolUse hooks
 │   ├── memory/                      # (Reserved) USER.md / MEMORY.md / STATE.md
-│   └── inbox/                       # (Reserved) Staged multimodal attachments per conv_id
+│   └── inbox/                       # Staged multimodal attachments per conv_id / binding (0600, TTL-pruned)
 ├── agy-server/                      # Read-only to systemd service (except data/)
 │   ├── .env                         # 0600 secrets (loaded directly, never exported to child env)
 │   ├── data/                        # 0700 writable runtime directory
@@ -274,6 +274,7 @@ The bridge supports isolated full-process testing alongside a live staging daemo
 | `server/config.py` | `.env` parser (no `os.environ` mutation), validation, `0600` IPC token helper |
 | `server/router.py` | Endpoint-locked router, generation-guarded debouncer, commands, approval & SSH sync handlers |
 | `server/approvals.py` | Lock-free, fail-closed Telegram inline-button approval manager (120s TTL, single-use nonce) |
+| `server/attachments.py` | Multimodal Telegram media extraction, sanitized `0600` inbox staging, size caps, and TTL pruning |
 | `server/db.py` | SQLite WAL store (`bindings`, `message_log`, `kv_state`, read-only URI mode) |
 | `server/agy_runner.py` | Headless `agy -p` subprocess wrapper, scrubbed env (`AGY_BRIDGE_ORIGIN`, `AGY_BRIDGE_BINDING_ID`), `ZoneInfo` timestamps |
 | `server/failure_analyzer.py` | Two-stage failure classifier + delimited Alpha recovery prompt builder |
@@ -303,8 +304,9 @@ The bridge supports isolated full-process testing alongside a live staging daemo
    - Separate strictly fail-closed `server/hook_approve.py` + lock-free `server/approvals.py` (`POST /approve` with `X-Bridge-Token`).
    - Passes `AGY_BRIDGE_BINDING_ID` into headless `agy -p` turns so Turn-1 tool calls resolve the target Telegram chat/topic before `agy_conversation_id` is saved.
    - Enables `callback_query` in `allowed_updates`, authenticates `callback_query.from.id` + `chat_id` server-side, binds each button to a single-use 24-hex nonce + tool/args SHA-256 digest + 120s TTL, and fails closed to `deny` on timeout, IPC error, or daemon shutdown. Manual SSH sessions (`AGY_BRIDGE_ORIGIN` unset) pass through via `allow`.
-3. **Multimodal Telegram Inputs:**
-   - Download incoming photos, files, voice notes, and locations into `~/alpha-assistant/inbox/<conv_id>/` with sanitized filenames, canonical `is_relative_to` confinement, max file size caps, and automated TTL pruning (disk hygiene for 256 GB NVMe).
+3. **Multimodal Telegram Inputs (Implemented in v1.4):**
+   - Incoming photos (highest-resolution variant), documents, voice notes, audio, videos, stickers, and locations are extracted after allowlist authorization (`server/attachments.py`) and coalesced across albums via the existing debouncer.
+   - Worker threads download files via Bot API `getFile` + streaming size-capped `download_file` (`MAX_ATTACHMENT_BYTES`, default 15 MiB; rejects traversal/unsafe `file_path` and redacts bot tokens from errors), stage atomically with `O_CREAT|O_EXCL|O_NOFOLLOW` (`0600`) inside `~/alpha-assistant/inbox/<conv_id>/` with sanitized filenames and canonical `is_relative_to` confinement, pass paths in `[attachments: ...]`, and prune expired files automatically (`INBOX_RETENTION_DAYS`, default 7 days).
 4. **Memory, Retention & Watchers:**
    - Populate `~/alpha-assistant/memory/{USER.md,MEMORY.md}`, add a daily OAuth/quota watchdog calling `POST /watcher` with `X-Bridge-Token`, and schedule SQLite backups + retention pruning for archived transcripts and `message_log`.
 5. **Gmail Adapter (Channel Trust Tiers):**

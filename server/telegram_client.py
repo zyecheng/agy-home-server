@@ -9,6 +9,7 @@ import json
 import logging
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime
@@ -16,6 +17,10 @@ from datetime import datetime
 from .formatting import markdown_to_telegram_html
 
 log = logging.getLogger("agy-bridge.telegram")
+
+
+class FileTooLargeError(ValueError):
+    """Raised when an incoming Telegram attachment exceeds the configured byte limit."""
 
 BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "status", "description": "Host & conversation status"},
@@ -213,6 +218,69 @@ class TelegramClient:
             timeout=15,
             retries=1,
         )
+
+    def get_file(self, file_id: str) -> dict:
+        if not self.configured:
+            raise RuntimeError("Telegram client not configured for getFile")
+        res = self._api_json("getFile", {"file_id": file_id}, timeout=20, retries=1)
+        result = res.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("Invalid getFile response from Telegram API")
+        return result
+
+    def download_file(
+        self,
+        file_path: str,
+        *,
+        max_bytes: int = 15 * 1024 * 1024,
+        timeout: int = 60,
+    ) -> bytes:
+        """Stream-download a Telegram file by file_path with strict size cap and path validation."""
+        if not self.configured:
+            raise RuntimeError("Telegram client not configured for file download")
+        clean_path = (file_path or "").strip()
+        if (
+            not clean_path
+            or clean_path.startswith("/")
+            or "\\" in clean_path
+            or "://" in clean_path
+            or any(part in ("", ".", "..") for part in clean_path.split("/"))
+            or any(ord(ch) < 32 for ch in clean_path)
+        ):
+            raise ValueError(f"Unsafe Telegram file_path: {file_path!r}")
+
+        quoted = urllib.parse.quote(clean_path, safe="/")
+        url = f"{self.api_base_url}/file/bot{self.token}/{quoted}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw_len = resp.headers.get("Content-Length")
+                if raw_len is not None:
+                    try:
+                        if int(raw_len) > max_bytes:
+                            raise FileTooLargeError(
+                                f"Attachment Content-Length exceeds limit ({int(raw_len):,} > {max_bytes:,} bytes)"
+                            )
+                    except ValueError:
+                        pass
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise FileTooLargeError(
+                            f"Attachment stream exceeded limit ({max_bytes:,} bytes)"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except urllib.error.HTTPError as exc:
+            # Never propagate raw URL containing bot token in exception text
+            raise RuntimeError(f"Telegram file download failed with HTTP {exc.code}") from None
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Telegram file download network error: {exc.reason}") from None
 
     def send_message(
         self,

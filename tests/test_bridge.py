@@ -20,12 +20,18 @@ from unittest import mock
 
 from server.agy_runner import AgyResult, AgyRunner, build_scrubbed_env, format_channel_envelope
 from server.alpha_ssh import select_binding
+from server.attachments import (
+    extract_telegram_media,
+    prune_inbox,
+    sanitize_filename,
+    stage_telegram_media,
+)
 from server.bot import sd_notify, start_ipc_server
 from server.config import BridgeConfig, ensure_ipc_token, validate_telegram_api_base_url
 from server.db import BridgeStore
 from server.formatting import markdown_to_telegram_html
 from server.router import BridgeRouter, InboundMessage
-from server.telegram_client import BOT_COMMANDS, TelegramClient, build_two_line_preview
+from server.telegram_client import BOT_COMMANDS, FileTooLargeError, TelegramClient, build_two_line_preview
 from tests.mock_telegram import MockTelegramServer
 from server.transcript import (
     extract_user_request_text,
@@ -984,6 +990,107 @@ class BridgeTestCase(unittest.TestCase):
         )
         self.assertEqual(len(runner.calls), 0)
         self.assertIn("Turn could not complete", fallback)
+
+    def test_multimodal_attachments_sanitization_size_cap_security_and_ttl_pruning(self) -> None:
+        # 1. Filename sanitization blocks traversal, dotfiles, and invalid extensions
+        self.assertEqual(sanitize_filename("../../.bashrc", kind="document"), "bashrc.bin")
+        self.assertEqual(sanitize_filename(r"C:\evil\my report (1).PDF", kind="document"), "my_report_1.pdf")
+        self.assertEqual(sanitize_filename(".env", kind="document", mime_type="text/plain"), "env.txt")
+        self.assertEqual(sanitize_filename("", kind="voice", mime_type="audio/ogg"), "voice.ogg")
+
+        # 2. Media extraction picks largest photo & formats location+venue
+        media, loc = extract_telegram_media(
+            {
+                "photo": [
+                    {"file_id": "small", "width": 100, "height": 100, "file_size": 1000},
+                    {"file_id": "large", "width": 1280, "height": 720, "file_size": 50000},
+                ],
+                "voice": {"file_id": "v1", "mime_type": "audio/ogg", "duration": 4, "file_size": 4096},
+                "location": {"latitude": 37.422, "longitude": -122.084, "horizontal_accuracy": 12},
+                "venue": {"title": "HQ", "address": "1600 Amphitheatre"},
+            }
+        )
+        self.assertEqual([(m.kind, m.file_id) for m in media], [("photo", "large"), ("voice", "v1")])
+        self.assertIn("lat=37.422000", loc)
+        self.assertIn("venue=HQ", loc)
+
+        # 3. Live MockTelegramServer getFile + download_file + staging + security checks
+        mock_tg = MockTelegramServer(expected_token="77777:secret-token-xyz")
+        try:
+            client = TelegramClient(mock_tg.expected_token, api_base_url=mock_tg.base_url)
+            mock_tg.register_file("f-ok", "photos/img_1.jpg", b"\xff\xd8\xffhello-jpeg")
+            mock_tg.register_file("f-big", "docs/huge.bin", b"A" * 4096)
+
+            # Unsafe remote file_path must be rejected
+            for bad_path in ("../etc/passwd", "/abs/path", "http://evil/x", "a\\b"):
+                with self.assertRaises(ValueError):
+                    client.download_file(bad_path)
+
+            # Missing file HTTP 404 must NEVER leak the bot token in error text
+            with self.assertRaises(RuntimeError) as ctx_404:
+                client.download_file("photos/does_not_exist.jpg")
+            self.assertNotIn("secret-token-xyz", str(ctx_404.exception))
+
+            # Oversized stream rejected with FileTooLargeError
+            with self.assertRaises(FileTooLargeError):
+                client.download_file("docs/huge.bin", max_bytes=1024)
+
+            # Successful staging into inbox/<scope>/
+            staged = stage_telegram_media(
+                client,
+                media[0].__class__(kind="photo", file_id="f-ok", file_name="../pic.jpg", mime_type="image/jpeg"),
+                workspace_dir=self.workspace,
+                scope_name="conv-media-1",
+                message_id="42",
+                max_bytes=1024 * 1024,
+            )
+            self.assertTrue(staged.path.exists())
+            self.assertEqual(staged.path.read_bytes(), b"\xff\xd8\xffhello-jpeg")
+            self.assertTrue(staged.path.resolve().is_relative_to((self.workspace / "inbox" / "conv-media-1").resolve()))
+            self.assertTrue(staged.path.name.endswith("-pic.jpg"))
+
+            # Path traversal scope rejected
+            with self.assertRaises(ValueError):
+                stage_telegram_media(
+                    client,
+                    media[0].__class__(kind="photo", file_id="f-ok"),
+                    workspace_dir=self.workspace,
+                    scope_name="../../escape",
+                    message_id="43",
+                )
+
+            # Unauthorized user sending a photo must NEVER trigger getFile
+            before_calls = len(mock_tg.get_file_calls)
+            router = BridgeRouter(self.cfg, self.store, FakeRunner([]), client)  # type: ignore[arg-type]
+            router.handle_telegram_update(
+                {
+                    "update_id": 500,
+                    "message": {
+                        "message_id": 50,
+                        "from": {"id": 999, "is_bot": False},
+                        "chat": {"id": 111, "type": "private"},
+                        "photo": [{"file_id": "f-ok", "width": 10, "height": 10}],
+                    },
+                }
+            )
+            router.shutdown(timeout_seconds=2.0)
+            self.assertEqual(len(mock_tg.get_file_calls), before_calls)
+
+            # 4. TTL inbox pruning deletes old files + empty dirs, keeps fresh files
+            old_dir = self.workspace / "inbox" / "old-conv"
+            old_dir.mkdir(parents=True, exist_ok=True)
+            old_file = old_dir / "stale.jpg"
+            old_file.write_bytes(b"old")
+            old_ts = time.time() - (10 * 86400)
+            os.utime(old_file, (old_ts, old_ts))
+
+            removed = prune_inbox(self.workspace, retention_days=7)
+            self.assertEqual(removed, 1)
+            self.assertFalse(old_file.exists())
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(staged.path.exists())
+        finally:
+            mock_tg.close()
 
 
 if __name__ == "__main__":

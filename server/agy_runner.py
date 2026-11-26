@@ -68,6 +68,7 @@ def format_channel_envelope(
     if attachments:
         safe_att = [_sanitize_header_val(a) for a in attachments]
         lines.append("[attachments: " + ", ".join(safe_att) + "]")
+        lines.append("[note: inspect the staged attachment path(s) above with view_file/read_file]")
     lines.append(text.strip())
     return "\n".join(lines)
 

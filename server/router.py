@@ -15,6 +15,13 @@ from pathlib import Path
 
 from .agy_runner import AgyResult, AgyRunner, format_channel_envelope
 from .approvals import ApprovalManager
+from .attachments import (
+    PendingMedia,
+    StagedAttachment,
+    extract_telegram_media,
+    prune_inbox,
+    stage_telegram_media,
+)
 from .config import VALID_MIRROR_MODES, BridgeConfig
 from .db import Binding, BridgeStore
 from .failure_analyzer import (
@@ -22,7 +29,7 @@ from .failure_analyzer import (
     build_recovery_prompt,
     format_fallback_report,
 )
-from .telegram_client import TelegramClient
+from .telegram_client import FileTooLargeError, TelegramClient
 from .transcript import (
     get_latest_step_index,
     is_safe_conversation_id,
@@ -35,6 +42,7 @@ log = logging.getLogger("agy-bridge.router")
 
 SSH_BUSY_TTL_SECONDS = 300.0
 RECOVERY_TIMEOUT_SECONDS = 45
+INBOX_PRUNE_INTERVAL_SECONDS = 6 * 3600.0
 
 
 @dataclass
@@ -49,6 +57,7 @@ class InboundMessage:
     text: str
     topic_name: str = ""
     attachments: list[str] = field(default_factory=list)
+    pending_media: list[PendingMedia] = field(default_factory=list)
 
 
 class BridgeRouter:
@@ -88,6 +97,7 @@ class BridgeRouter:
         self._workers_guard = threading.Lock()
         self._workers: set[threading.Thread] = set()
         self._shutting_down = threading.Event()
+        self._last_inbox_prune_mono = 0.0
 
     def _get_endpoint_lock(
         self, channel: str, chat_id: str, thread_id: int
@@ -218,7 +228,10 @@ class BridgeRouter:
             return
 
         text = (msg.get("text") or msg.get("caption") or "").strip()
-        if not text:
+        pending_media, location_note = extract_telegram_media(msg)
+        if location_note:
+            text = f"{text}\n{location_note}".strip() if text else location_note
+        if not text and not pending_media:
             return
 
         if not self.is_authorized_telegram(user_id, chat_id, is_bot=is_bot):
@@ -248,9 +261,10 @@ class BridgeRouter:
             message_id=str(msg.get("message_id") or ""),
             text=text,
             topic_name=topic_name,
+            pending_media=pending_media,
         )
 
-        if text.startswith("/"):
+        if text.startswith("/") and not pending_media:
             self._spawn_worker(self._handle_command, (inbound,))
             return
 
@@ -391,11 +405,64 @@ class BridgeRouter:
         if binding.agy_conversation_id:
             self._mirror_binding_locked(binding, transcript_path=None)
 
+    def _maybe_prune_inbox(self, workspace_dir: Path, *, force: bool = False) -> int:
+        if self.config.inbox_retention_days <= 0:
+            return 0
+        now_m = time.monotonic()
+        with self._state_guard:
+            if not force and (now_m - self._last_inbox_prune_mono) < INBOX_PRUNE_INTERVAL_SECONDS:
+                return 0
+            self._last_inbox_prune_mono = now_m
+        try:
+            return prune_inbox(
+                workspace_dir,
+                retention_days=self.config.inbox_retention_days,
+            )
+        except Exception:
+            log.exception("Failed pruning inbox under %s", workspace_dir)
+            return 0
+
+    def _stage_batch_media(
+        self,
+        batch: list[InboundMessage],
+        *,
+        binding: Binding,
+    ) -> tuple[list[StagedAttachment], list[str]]:
+        staged: list[StagedAttachment] = []
+        errors: list[str] = []
+        items = [(m.message_id, pm) for m in batch for pm in m.pending_media]
+        if not items:
+            return staged, errors
+
+        workspace_dir = Path(binding.workspace_dir)
+        self._maybe_prune_inbox(workspace_dir)
+        scope_name = binding.agy_conversation_id or f"binding-{binding.id}"
+
+        for mid, pm in items:
+            label = pm.file_name or pm.kind
+            try:
+                rec = stage_telegram_media(
+                    self.telegram,
+                    pm,
+                    workspace_dir=workspace_dir,
+                    scope_name=scope_name,
+                    message_id=mid,
+                    max_bytes=self.config.max_attachment_bytes,
+                )
+                staged.append(rec)
+            except FileTooLargeError as exc:
+                log.warning("Rejected oversized Telegram attachment (%s): %s", label, exc)
+                errors.append(f"{label}: {exc}")
+            except Exception as exc:
+                log.exception("Failed staging Telegram attachment (%s)", label)
+                errors.append(f"{label}: download failed ({exc})")
+        return staged, errors
+
     def _process_batch(self, batch: list[InboundMessage]) -> None:
         first = batch[0]
         topic_name = next((m.topic_name for m in batch if m.topic_name), "")
-        combined_text = "\n\n".join(m.text for m in batch)
-        attachments = [a for m in batch for a in m.attachments]
+        combined_text = "\n\n".join(m.text for m in batch if m.text)
+        pre_attachments = [a for m in batch for a in m.attachments]
 
         # Wait for active SSH session OUTSIDE endpoint lock so Stop hook is never blocked
         pre_binding = self.store.get_active_binding(
@@ -426,12 +493,42 @@ class BridgeRouter:
                 return
             binding = refreshed
 
+            staged_records, stage_errors = self._stage_batch_media(batch, binding=binding)
+            if stage_errors:
+                notice = "Could not attach:\n" + "\n".join(f"- {e}" for e in stage_errors)
+                try:
+                    self.telegram.send_message(
+                        binding.chat_id,
+                        notice,
+                        thread_id=binding.thread_id,
+                        disable_notification=True,
+                    )
+                except Exception:
+                    log.exception("Failed sending attachment skip notice")
+
+            attachments = pre_attachments + [str(s.path) for s in staged_records]
+            if not combined_text and not attachments:
+                return
+
+            if not combined_text and attachments:
+                if staged_records and all(s.kind in ("voice", "audio") for s in staged_records):
+                    combined_text = (
+                        "The user sent a voice/audio message without text. "
+                        "Inspect the attached audio file and respond directly in the same language."
+                    )
+                else:
+                    combined_text = (
+                        "The user sent attachment(s) without a caption. "
+                        "Inspect the attached file(s) and respond concisely."
+                    )
+
             self.store.log_message(
                 binding.id,
                 direction="in",
                 origin=first.channel,
                 external_message_id=first.message_id,
                 content_preview=combined_text,
+                attachments=[s.to_log_dict() for s in staged_records] or None,
             )
 
             envelope = format_channel_envelope(
@@ -939,7 +1036,8 @@ class BridgeRouter:
         return sent
 
     def recover_after_startup(self, *, unclean_exit: bool) -> int:
-        """Reconcile finished-but-undelivered transcript steps and notify primary DM on unclean restart."""
+        """Reconcile finished-but-undelivered transcript steps, prune expired inbox files, and alert on unclean restart."""
+        self._maybe_prune_inbox(self.config.alpha_workspace, force=True)
         reconciled = 0
         for binding in self.store.list_active_bindings():
             if not binding.agy_conversation_id:

@@ -729,6 +729,110 @@ class Tier1E2EStressChaosTest(unittest.TestCase):
             notify_stop.set()
             notify_srv.close()
 
+    def test_05_multimodal_attachments_album_voice_location_and_size_limit(self) -> None:
+        self.bot = BotProcessHarness(
+            root=self.root,
+            mock_tg=self.tg,
+            agy_bin=FAKE_AGY,
+            debounce_seconds=0.15,
+            extra_env={"MAX_ATTACHMENT_BYTES": "2048", "INBOX_RETENTION_DAYS": "7"},
+        )
+        self.bot.start()
+
+        self.tg.register_file("pic-1", "photos/a.jpg", b"JPEGDATA1")
+        self.tg.register_file("pic-2", "photos/b.jpg", b"JPEGDATA22")
+        self.tg.register_file("voice-1", "voice/note.ogg", b"OGGAUDIO12345")
+        self.tg.register_file("big-doc", "docs/too_big.pdf", b"X" * 4096)
+
+        # 1. Unauthorized photo must NOT be downloaded
+        self.tg.push_raw_message(
+            {
+                "from": {"id": 999, "is_bot": False},
+                "chat": {"id": 111, "type": "private"},
+                "photo": [{"file_id": "pic-1", "width": 100, "height": 100}],
+            }
+        )
+
+        # 2. Two-photo album with caption on first photo -> coalesced into ONE agy turn with 2 staged files!
+        self.tg.push_raw_message(
+            {
+                "from": {"id": 111, "is_bot": False},
+                "chat": {"id": 111, "type": "private"},
+                "caption": "compare these two",
+                "photo": [{"file_id": "pic-1", "width": 640, "height": 480, "file_size": 9}],
+            }
+        )
+        self.tg.push_raw_message(
+            {
+                "from": {"id": 111, "is_bot": False},
+                "chat": {"id": 111, "type": "private"},
+                "photo": [{"file_id": "pic-2", "width": 640, "height": 480, "file_size": 10}],
+            }
+        )
+        ok = self.tg.wait_for(
+            lambda: any("ATTACHED_OK[2:19:" in m["text"] and "compare these two" in m["text"] for m in self.tg.sent_messages),
+            timeout=15.0,
+        )
+        self.assertTrue(ok, f"Album staging failed. msgs={self.tg.sent_messages}\nstderr={self.bot.read_stderr()}")
+
+        # 3. Captionless voice note -> stages .ogg and supplies voice default prompt
+        before_voice = len(self.tg.sent_messages)
+        self.tg.push_raw_message(
+            {
+                "from": {"id": 111, "is_bot": False},
+                "chat": {"id": 111, "type": "private"},
+                "voice": {"file_id": "voice-1", "mime_type": "audio/ogg", "duration": 3, "file_size": 13},
+            }
+        )
+        ok = self.tg.wait_for(
+            lambda: any(
+                "ATTACHED_OK[1:13:" in m["text"] and ".ogg" in m["text"]
+                for m in self.tg.sent_messages[before_voice:]
+            ),
+            timeout=15.0,
+        )
+        self.assertTrue(ok, f"Voice staging failed. msgs={self.tg.sent_messages[before_voice:]}")
+
+        # 4. Location-only message -> routed cleanly with coordinates
+        before_loc = len(self.tg.sent_messages)
+        self.tg.push_raw_message(
+            {
+                "from": {"id": 111, "is_bot": False},
+                "chat": {"id": 111, "type": "private"},
+                "location": {"latitude": 37.3346, "longitude": -122.009},
+            }
+        )
+        ok = self.tg.wait_for(
+            lambda: any("lat=37.334600" in m["text"] for m in self.tg.sent_messages[before_loc:]),
+            timeout=15.0,
+        )
+        self.assertTrue(ok, f"Location routing failed. msgs={self.tg.sent_messages[before_loc:]}")
+
+        # 5. Oversized document (>2048B) without caption -> rejected cleanly with skip notice, no crash
+        before_big = len(self.tg.sent_messages)
+        self.tg.push_raw_message(
+            {
+                "from": {"id": 111, "is_bot": False},
+                "chat": {"id": 111, "type": "private"},
+                "document": {
+                    "file_id": "big-doc",
+                    "file_name": "too_big.pdf",
+                    "mime_type": "application/pdf",
+                    "file_size": 4096,
+                },
+            }
+        )
+        ok = self.tg.wait_for(
+            lambda: any(
+                "Could not attach:" in m["text"] and "too_big.pdf" in m["text"]
+                for m in self.tg.sent_messages[before_big:]
+            ),
+            timeout=15.0,
+        )
+        self.assertTrue(ok, f"Oversized notice missing. msgs={self.tg.sent_messages[before_big:]}")
+        self.assertNotIn("Traceback (most recent call last)", self.bot.read_stderr())
+        self._check_db_integrity(self.bot.db_path)
+
 
 if __name__ == "__main__":
     unittest.main()

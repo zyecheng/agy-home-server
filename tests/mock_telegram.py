@@ -63,7 +63,10 @@ class MockTelegramServer:
         self.chat_actions: list[dict] = []
         self.registered_commands: list[dict] = []
         self.get_updates_calls: list[dict] = []
+        self.get_file_calls: list[str] = []
         self.faults_triggered: list[dict] = []
+        self._files_by_id: dict[str, tuple[str, bytes]] = {}
+        self._files_by_path: dict[str, bytes] = {}
 
         # Policy function: (msg_record) -> ("approve" | "deny" | "ignore", delay_seconds, user_id)
         self._approval_policy: Callable[[dict], tuple[str, float, int]] | None = None
@@ -85,6 +88,27 @@ class MockTelegramServer:
                     self.send_header("Connection", "close")
                     self.end_headers()
                     self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+            def do_GET(self) -> None:
+                prefix = f"/file/bot{mock_self.expected_token}/"
+                if not self.path.startswith(prefix):
+                    self._send_json(401, {"ok": False, "description": "Unauthorized"})
+                    return
+                rel_path = self.path[len(prefix) :].split("?", 1)[0]
+                with mock_self._lock:
+                    content = mock_self._files_by_path.get(rel_path)
+                if content is None:
+                    self._send_json(404, {"ok": False, "description": "File not found"})
+                    return
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(content)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
 
@@ -171,6 +195,30 @@ class MockTelegramServer:
                     self._send_json(200, {"ok": True, "result": True})
                     return
 
+                if method == "getFile":
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                    fid = str(payload.get("file_id") or "")
+                    with mock_self._lock:
+                        mock_self.get_file_calls.append(fid)
+                        entry = mock_self._files_by_id.get(fid)
+                    if entry is None:
+                        self._send_json(400, {"ok": False, "description": "Bad Request: invalid file_id"})
+                        return
+                    fpath, content = entry
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "result": {
+                                "file_id": fid,
+                                "file_unique_id": f"uniq-{fid}",
+                                "file_size": len(content),
+                                "file_path": fpath,
+                            },
+                        },
+                    )
+                    return
+
                 self._send_json(404, {"ok": False, "description": f"Unknown method {method}"})
 
         self._server = _ThreadedHTTPServer(("127.0.0.1", 0), Handler)
@@ -217,6 +265,23 @@ class MockTelegramServer:
                     return []
                 self._update_cond.wait(timeout=min(rem, 0.2))
             return []
+
+    def register_file(self, file_id: str, file_path: str, content: bytes) -> None:
+        with self._lock:
+            self._files_by_id[file_id] = (file_path, content)
+            self._files_by_path[file_path] = content
+
+    def push_raw_message(self, msg: dict) -> int:
+        with self._update_cond:
+            upd_id = self._next_update_id
+            self._next_update_id += 1
+            m = dict(msg)
+            if "message_id" not in m:
+                m["message_id"] = self._next_message_id
+                self._next_message_id += 1
+            self._updates.append({"update_id": upd_id, "message": m})
+            self._update_cond.notify_all()
+            return upd_id
 
     def push_message(
         self,
