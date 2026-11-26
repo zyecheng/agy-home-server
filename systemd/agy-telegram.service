@@ -1,0 +1,18 @@
+[Unit]
+Description=Antigravity Home AI Server Telegram Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agy
+WorkingDirectory=/home/agy/agy-server
+EnvironmentFile=-/home/agy/agy-server/.env
+ExecStart=/usr/bin/python3 /home/agy/agy-server/server/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

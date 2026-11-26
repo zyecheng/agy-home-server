@@ -1,0 +1,9 @@
+.env
+vm/*.ova
+vm/*.iso
+vm/*.exe
+vm/seed/user-data
+vm/seed/meta-data
+.venv/
+__pycache__/
+*.pyc
