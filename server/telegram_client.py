@@ -13,7 +13,18 @@ import urllib.request
 import uuid
 from datetime import datetime
 
+from .formatting import markdown_to_telegram_html
+
 log = logging.getLogger("agy-bridge.telegram")
+
+BOT_COMMANDS: list[dict[str, str]] = [
+    {"command": "status", "description": "Host & conversation status"},
+    {"command": "mirror", "description": "Set SSH mirror mode (full | replies_only | muted)"},
+    {"command": "compact", "description": "Compact current conversation context"},
+    {"command": "reset", "description": "Archive thread and start a fresh conversation"},
+    {"command": "id", "description": "Show chat, thread, and conversation IDs"},
+    {"command": "help", "description": "List available commands"},
+]
 
 
 def build_two_line_preview(text: str, *, max_caption_chars: int = 900) -> str:
@@ -178,6 +189,7 @@ class TelegramClient:
                 full_text,
                 thread_id=thread_id,
                 disable_notification=disable_notification,
+                markdown=True,
             )
 
         caption = build_two_line_preview(full_text)
@@ -192,6 +204,16 @@ class TelegramClient:
             disable_notification=disable_notification,
         )
 
+    def set_my_commands(self, commands: list[dict[str, str]] | None = None) -> dict:
+        if not self.configured:
+            return {"ok": True, "dry_run": True}
+        return self._api_json(
+            "setMyCommands",
+            {"commands": commands if commands is not None else BOT_COMMANDS},
+            timeout=15,
+            retries=1,
+        )
+
     def send_message(
         self,
         chat_id: str | int,
@@ -200,6 +222,7 @@ class TelegramClient:
         thread_id: int = 0,
         disable_notification: bool = False,
         reply_markup: dict | None = None,
+        markdown: bool = False,
     ) -> dict:
         if not self.configured:
             log.info(
@@ -212,16 +235,34 @@ class TelegramClient:
             return {"ok": True, "dry_run": True}
 
         safe_text = text if len(text) <= 4090 else text[:4087] + "..."
-        payload: dict = {
+        base_payload: dict = {
             "chat_id": int(chat_id),
-            "text": safe_text,
             "disable_notification": bool(disable_notification),
         }
         if thread_id > 1:
-            payload["message_thread_id"] = int(thread_id)
+            base_payload["message_thread_id"] = int(thread_id)
         if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return self._api_json("sendMessage", payload)
+            base_payload["reply_markup"] = reply_markup
+
+        if markdown:
+            html_text = markdown_to_telegram_html(safe_text)
+            if len(html_text) <= 4096:
+                html_payload = dict(base_payload)
+                html_payload["text"] = html_text
+                html_payload["parse_mode"] = "HTML"
+                try:
+                    return self._api_json("sendMessage", html_payload)
+                except (urllib.error.HTTPError, RuntimeError) as exc:
+                    if isinstance(exc, urllib.error.HTTPError) and exc.code != 400:
+                        raise
+                    log.warning(
+                        "Telegram HTML parse failed (%s); falling back to plain text",
+                        exc,
+                    )
+
+        plain_payload = dict(base_payload)
+        plain_payload["text"] = safe_text
+        return self._api_json("sendMessage", plain_payload)
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict:
         if not self.configured:

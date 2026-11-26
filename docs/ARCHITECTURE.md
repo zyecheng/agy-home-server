@@ -151,9 +151,10 @@ To keep personal Alpha interactions isolated from plain engineering/admin work a
 6. **Headless Execution (`server/agy_runner.py`):** Runs `agy -p "<envelope>" [--conversation <id>] --output-format json --disable-slash-commands` in `~/alpha-assistant/` with a scrubbed environment (`TELEGRAM_*` and `BRIDGE_IPC_*` stripped; `AGY_BRIDGE_ORIGIN=bridge` and non-secret `AGY_BRIDGE_BINDING_ID=<binding.id>` set so Turn-1 `PreToolUse` hooks can resolve the target chat/topic before `agy_conversation_id` is saved).
    - Timestamps use Python stdlib `ZoneInfo(BRIDGE_TIMEZONE)` (automatic PST/PDT). Envelope header values strip brackets and newlines to prevent header spoofing.
    - `subprocess.TimeoutExpired` is caught and returned as `AgyResult(status="TIMEOUT")` into the failure analyzer; `AGY_TIMEOUT_SECONDS=0` disables the subprocess timeout (`None`).
-7. **Delivery (`server/telegram_client.py`):**
+7. **Delivery (`server/telegram_client.py` & `server/formatting.py`):**
+   - Registers `/status`, `/mirror`, `/compact`, `/reset`, `/id`, `/help` via `setMyCommands` on startup.
    - Bounded retries on transient network errors, HTTP 5xx, and HTTP 429 (`retry_after`), verifying `"ok": true`.
-   - `<= 3,500` chars → `sendMessage` inline.
+   - `<= 3,500` chars → converts Markdown to Telegram `parse_mode="HTML"` (`<b>`, `<i>`, `<code>`, `<pre>`, `<blockquote>`, safe `<a>` links) via `sendMessage`, with automatic plain-text fallback on HTTP `400` parse errors.
    - `> 3,500` chars → uploads `alpha-reply-<timestamp>.md` via multipart `sendDocument` with a **2-line preview caption** + character count.
 8. **Watermark Advance:** Updates `bindings.last_mirrored_step` **only after** Telegram delivery succeeds.
 
@@ -255,7 +256,7 @@ The bridge supports isolated full-process testing alongside a live staging daemo
 
 | Tier | Command (on `agy-staging`) | Scope & Guarantees |
 | --- | --- | --- |
-| **Unit & Integration** (`tests/test_bridge.py`, 18 tests) | `python3 -m unittest discover -s tests -v` | Routing, debounce, SQLite WAL, fail-closed auth, IPC token/CSRF, transcript containment, failure recovery, approval nonces/spoofing, `sd_notify` datagrams. |
+| **Unit & Integration** (`tests/test_bridge.py`, 19 tests) | `python3 -m unittest discover -s tests -v` | Routing, debounce, SQLite WAL, fail-closed auth, IPC token/CSRF, transcript containment, failure recovery, approval nonces/spoofing, `sd_notify` datagrams, Markdown→HTML + `400` fallback. |
 | **Tier 1: Full-Process E2E, Stress & Chaos** (`tests/test_e2e_stress.py`, 4 suites) | Included in `unittest discover` (0 LLM quota, ~38s) | Spawns real `python3 -m server.bot` against `MockTelegramServer` + realistic `tests/fake_agy.py` (which invokes real `hook_approve.py` & `hook_notify.py`):<br>• Full lifecycle (Turn-1 `bindingId` approve, deny + recovery, `>3500`-char UTF-8 `.md` multipart upload, SSH mirror, commands, secret-leak guard)<br>• 10-topic parallel burst stress (70+ turns, RSS & FD bounds, `PRAGMA integrity_check`)<br>• Fault injection (`429` retry, `502`/socket drop, duplicate `update_id`, `0.8s` timeout, mid-approval `SIGTERM` restart)<br>• `SIGKILL` (`kill -9`) crash recovery + stranded reply delivery + `READY=1`/`WATCHDOG=1`/`STOPPING=1` verification. |
 | **Tier 2: Real `agy` Automated E2E** (`tests/test_e2e_live_agy.py`, opt-in) | `RUN_LIVE_AGY_E2E=1 python3 -m unittest tests/test_e2e_live_agy.py -v` | Runs real `bot.py` + real `agy` CLI + real `hooks.json` against local `MockTelegramServer` (auto-clicks `[Approve]` and `[Deny]`, verifies real `run_command` execution/denial and real SSH `Stop` hook mirroring; ~50s, ~4 small LLM turns). |
 
@@ -277,7 +278,8 @@ The bridge supports isolated full-process testing alongside a live staging daemo
 | `server/agy_runner.py` | Headless `agy -p` subprocess wrapper, scrubbed env (`AGY_BRIDGE_ORIGIN`, `AGY_BRIDGE_BINDING_ID`), `ZoneInfo` timestamps |
 | `server/failure_analyzer.py` | Two-stage failure classifier + delimited Alpha recovery prompt builder |
 | `server/transcript.py` | Contained `transcript_full.jsonl` / `transcript.jsonl` streaming parser |
-| `server/telegram_client.py` | Stdlib Telegram Bot API client (retry/429, inline keyboards/callbacks, `.md` upload >3,500 chars) |
+| `server/telegram_client.py` | Stdlib Telegram Bot API client (retry/429, `setMyCommands`, HTML w/ fallback, inline keyboards, `.md` upload >3,500 chars) |
+| `server/formatting.py` | Stdlib Markdown → Telegram HTML converter (code blocks, inline code, headings, quotes, safe links) |
 | `server/hook_notify.py` | Non-blocking authenticated `PreInvocation`/`Stop` hook → localhost IPC forwarder |
 | `server/hook_approve.py` | Strictly fail-closed `PreToolUse` hook → `POST /approve` Telegram approval gate |
 | `server/alpha_ssh.py` | Read-only SSH helper CLI (`alpha-ssh`) with exact numeric ID matching |
@@ -286,7 +288,7 @@ The bridge supports isolated full-process testing alongside a live staging daemo
 | `scripts/setup-vm.ps1` & `build-cidata-iso.ps1` | Reproducible VirtualBox + `cloud-init` provisioning |
 | `scripts/set-bot-token.ps1` | Masked Windows GUI secret injector |
 | `systemd/agy-telegram.service` | Hardened `systemd` unit (`Type=notify`, `WatchdogSec=120`, `KillMode=control-group`) |
-| `tests/test_bridge.py` | Unit & integration test suite (18 tests) |
+| `tests/test_bridge.py` | Unit & integration test suite (19 tests) |
 | `tests/mock_telegram.py` & `tests/fake_agy.py` | Local mock Telegram Bot API (with fault injection & auto-click) + realistic stub `agy` CLI |
 | `tests/test_e2e_stress.py` | Tier 1 full-process E2E, 10-topic stress, chaos (`429`/`502`/`SIGTERM`/`SIGKILL`) suite |
 | `tests/test_e2e_live_agy.py` | Tier 2 opt-in (`RUN_LIVE_AGY_E2E=1`) automated E2E against real `agy` CLI & real hooks |

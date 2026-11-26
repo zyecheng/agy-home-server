@@ -243,6 +243,12 @@ class Tier1E2EStressChaosTest(unittest.TestCase):
         )
         self.bot.start()
 
+        # 0. Verify bot registered Telegram slash command menu via setMyCommands
+        ok = self.tg.wait_for(lambda: len(self.tg.registered_commands) >= 6, timeout=5.0)
+        self.assertTrue(ok, f"setMyCommands not called: {self.tg.registered_commands}")
+        cmd_names = {c["command"] for c in self.tg.registered_commands}
+        self.assertTrue({"status", "mirror", "compact", "reset", "id", "help"}.issubset(cmd_names))
+
         # 1. Unauthorized & bot messages must be ignored
         self.tg.push_message(chat_id=111, user_id=999, text="intruder")
         self.tg.push_message(chat_id=111, user_id=111, is_bot=True, text="bot loop")
@@ -285,7 +291,18 @@ class Tier1E2EStressChaosTest(unittest.TestCase):
         self.assertTrue(ok, f"Deny+recovery failed. msgs={self.tg.sent_messages}")
         self.assertTrue(any("Denied via Telegram" in e["text"] for e in self.tg.edited_messages))
 
-        # 4. Long reply (>3500 chars, UTF-8 Chinese + emoji) -> multipart sendDocument .md
+        # 4. Markdown reply renders as Telegram HTML + long reply (>3500 chars, UTF-8) uploads .md
+        self.tg.push_message(chat_id=111, text="check **bold** and `inline`")
+        ok = self.tg.wait_for(
+            lambda: any(
+                m.get("parse_mode") == "HTML"
+                and "<b>bold</b> and <code>inline</code>" in m["text"]
+                for m in self.tg.sent_messages
+            ),
+            timeout=10.0,
+        )
+        self.assertTrue(ok, f"Markdown->HTML delivery failed. msgs={self.tg.sent_messages}")
+
         self.tg.push_message(chat_id=111, text="[long]")
         ok = self.tg.wait_for(lambda: len(self.tg.sent_documents) >= 1, timeout=15.0)
         self.assertTrue(ok, f"Long .md upload failed. stderr={self.bot.read_stderr()}")

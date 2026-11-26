@@ -61,6 +61,7 @@ class MockTelegramServer:
         self.edited_messages: list[dict] = []
         self.answered_callbacks: list[dict] = []
         self.chat_actions: list[dict] = []
+        self.registered_commands: list[dict] = []
         self.get_updates_calls: list[dict] = []
         self.faults_triggered: list[dict] = []
 
@@ -158,6 +159,14 @@ class MockTelegramServer:
                     payload = json.loads(raw_body.decode("utf-8") or "{}")
                     with mock_self._record_cond:
                         mock_self.chat_actions.append(payload)
+                        mock_self._record_cond.notify_all()
+                    self._send_json(200, {"ok": True, "result": True})
+                    return
+
+                if method == "setMyCommands":
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                    with mock_self._record_cond:
+                        mock_self.registered_commands = list(payload.get("commands") or [])
                         mock_self._record_cond.notify_all()
                     self._send_json(200, {"ok": True, "result": True})
                     return
@@ -276,6 +285,7 @@ class MockTelegramServer:
                 "chat_id": int(payload["chat_id"]),
                 "thread_id": int(payload.get("message_thread_id") or 0),
                 "text": str(payload.get("text") or ""),
+                "parse_mode": payload.get("parse_mode"),
                 "disable_notification": bool(payload.get("disable_notification", False)),
                 "reply_markup": payload.get("reply_markup"),
                 "ts": time.time(),

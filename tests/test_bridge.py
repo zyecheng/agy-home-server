@@ -23,8 +23,10 @@ from server.alpha_ssh import select_binding
 from server.bot import sd_notify, start_ipc_server
 from server.config import BridgeConfig, ensure_ipc_token
 from server.db import BridgeStore
+from server.formatting import markdown_to_telegram_html
 from server.router import BridgeRouter, InboundMessage
-from server.telegram_client import TelegramClient, build_two_line_preview
+from server.telegram_client import BOT_COMMANDS, TelegramClient, build_two_line_preview
+from tests.mock_telegram import MockTelegramServer
 from server.transcript import (
     extract_user_request_text,
     read_steps_after,
@@ -52,6 +54,7 @@ class FakeTelegram(TelegramClient):
         thread_id: int = 0,
         disable_notification: bool = False,
         reply_markup: dict | None = None,
+        markdown: bool = False,
     ) -> dict:
         self._msg_seq += 1
         msg_id = self._msg_seq
@@ -62,6 +65,7 @@ class FakeTelegram(TelegramClient):
             "text": text,
             "silent": disable_notification,
             "reply_markup": reply_markup,
+            "markdown": markdown,
         }
         self.sent_messages.append(item)
         return {"ok": True, "result": {"message_id": msg_id}}
@@ -859,6 +863,45 @@ class BridgeTestCase(unittest.TestCase):
             self.assertEqual(got, ["READY=1", "WATCHDOG=1", "STOPPING=1"])
         finally:
             srv.close()
+
+    def test_markdown_to_telegram_html_and_400_plain_fallback(self) -> None:
+        md = (
+            "## Summary\n"
+            "- **Bold** and *italic* and ~~old~~ with `x < y & z`\n"
+            "> Quoted <tag> line\n"
+            "[Safe](https://example.com/a?b=1&c=2) and [Evil](javascript:alert(1))\n"
+            "```python\n"
+            "if a < b and **not_bold**:\n"
+            "    print('ok')\n"
+            "```"
+        )
+        rendered = markdown_to_telegram_html(md)
+        self.assertIn("<b>Summary</b>", rendered)
+        self.assertIn("• <b>Bold</b> and <i>italic</i> and <s>old</s> with <code>x &lt; y &amp; z</code>", rendered)
+        self.assertIn("<blockquote>Quoted &lt;tag&gt; line</blockquote>", rendered)
+        self.assertIn('<a href="https://example.com/a?b=1&amp;c=2">Safe</a>', rendered)
+        self.assertNotIn("javascript:", rendered.split("href=", 1)[1].split(">", 1)[0])
+        self.assertNotIn('<a href="javascript:', rendered)
+        self.assertIn('<pre><code class="language-python">if a &lt; b and **not_bold**:', rendered)
+
+        mock_tg = MockTelegramServer()
+        try:
+            client = TelegramClient(mock_tg.expected_token, api_base_url=mock_tg.base_url)
+            client.set_my_commands(BOT_COMMANDS)
+            self.assertEqual(len(mock_tg.registered_commands), len(BOT_COMMANDS))
+
+            # Normal HTML send
+            client.send_message(111, "Hello **Alpha** `ok`", markdown=True)
+            self.assertEqual(mock_tg.sent_messages[-1]["parse_mode"], "HTML")
+            self.assertEqual(mock_tg.sent_messages[-1]["text"], "Hello <b>Alpha</b> <code>ok</code>")
+
+            # Simulated Telegram 400 parse error -> automatic plain-text fallback
+            mock_tg.inject_faults("sendMessage", [{"status": 400}])
+            client.send_message(111, "Fallback **raw**", markdown=True)
+            self.assertIsNone(mock_tg.sent_messages[-1]["parse_mode"])
+            self.assertEqual(mock_tg.sent_messages[-1]["text"], "Fallback **raw**")
+        finally:
+            mock_tg.close()
 
 
 if __name__ == "__main__":

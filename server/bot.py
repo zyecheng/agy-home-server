@@ -22,7 +22,7 @@ from .agy_runner import AgyRunner
 from .config import BridgeConfig, ensure_ipc_token
 from .db import BridgeStore
 from .router import BridgeRouter
-from .telegram_client import TelegramClient
+from .telegram_client import BOT_COMMANDS, TelegramClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -192,6 +192,12 @@ def main() -> int:
                 stop_event.wait(5.0)
             clean_exit = True
             return 0
+
+        try:
+            telegram.set_my_commands(BOT_COMMANDS)
+            log.info("Registered %d Telegram bot slash commands", len(BOT_COMMANDS))
+        except Exception as exc:
+            log.warning("Could not register Telegram slash commands: %s", exc)
 
         offset = int(store.get_kv("telegram_offset", "0") or "0")
         log.info(
