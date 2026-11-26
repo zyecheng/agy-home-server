@@ -21,7 +21,7 @@ from unittest import mock
 from server.agy_runner import AgyResult, AgyRunner, build_scrubbed_env, format_channel_envelope
 from server.alpha_ssh import select_binding
 from server.bot import sd_notify, start_ipc_server
-from server.config import BridgeConfig, ensure_ipc_token
+from server.config import BridgeConfig, ensure_ipc_token, validate_telegram_api_base_url
 from server.db import BridgeStore
 from server.formatting import markdown_to_telegram_html
 from server.router import BridgeRouter, InboundMessage
@@ -70,16 +70,8 @@ class FakeTelegram(TelegramClient):
         self.sent_messages.append(item)
         return {"ok": True, "result": {"message_id": msg_id}}
 
-    def answer_callback_query(
-        self,
-        callback_query_id: str,
-        *,
-        text: str = "",
-        show_alert: bool = False,
-    ) -> dict:
-        self.answered_callbacks.append(
-            {"id": callback_query_id, "text": text, "show_alert": show_alert}
-        )
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict:
+        self.answered_callbacks.append({"id": callback_query_id, "text": text})
         return {"ok": True}
 
     def edit_message_text(
@@ -579,9 +571,8 @@ class BridgeTestCase(unittest.TestCase):
             "telegram", "111", 0, "private", str(self.workspace)
         )
         # Note: Turn 1 has agy_conversation_id == None; must resolve via bindingId
-        router = BridgeRouter(
-            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=5.0  # type: ignore[arg-type]
-        )
+        cfg_5s = BridgeConfig(**{**self.cfg.__dict__, "approval_timeout_seconds": 5.0})
+        router = BridgeRouter(cfg_5s, self.store, FakeRunner([]), self.tg)  # type: ignore[arg-type]
         srv = start_ipc_server(self.cfg, router, token)
         port = srv.server_address[1]
         base_url = f"http://127.0.0.1:{port}"
@@ -666,9 +657,8 @@ class BridgeTestCase(unittest.TestCase):
             "telegram", "111", 0, "private", str(self.workspace)
         )
         self.store.set_conversation_id(binding.id, "conv-deny-1")
-        router = BridgeRouter(
-            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=5.0  # type: ignore[arg-type]
-        )
+        cfg_5s = BridgeConfig(**{**self.cfg.__dict__, "approval_timeout_seconds": 5.0})
+        router = BridgeRouter(cfg_5s, self.store, FakeRunner([]), self.tg)  # type: ignore[arg-type]
 
         outcome: dict = {}
 
@@ -746,9 +736,8 @@ class BridgeTestCase(unittest.TestCase):
         self.store.set_conversation_id(binding.id, "conv-bound-1")
 
         # 1. Timeout fail-closed
-        router_to = BridgeRouter(
-            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=0.1  # type: ignore[arg-type]
-        )
+        cfg_to = BridgeConfig(**{**self.cfg.__dict__, "approval_timeout_seconds": 0.1})
+        router_to = BridgeRouter(cfg_to, self.store, FakeRunner([]), self.tg)  # type: ignore[arg-type]
         res_to = router_to.handle_approval_request(
             {
                 "bindingId": str(binding.id),
@@ -781,9 +770,8 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(res_missing["decision"], "deny")
 
         # 4. Shutdown immediately cancels pending approvals fail-closed
-        router_sd = BridgeRouter(
-            self.cfg, self.store, FakeRunner([]), self.tg, approval_timeout_seconds=30.0  # type: ignore[arg-type]
-        )
+        cfg_30s = BridgeConfig(**{**self.cfg.__dict__, "approval_timeout_seconds": 30.0})
+        router_sd = BridgeRouter(cfg_30s, self.store, FakeRunner([]), self.tg)  # type: ignore[arg-type]
         sd_out: dict = {}
         t = threading.Thread(
             target=lambda: sd_out.setdefault(
@@ -798,12 +786,19 @@ class BridgeTestCase(unittest.TestCase):
         )
         t.start()
         deadline = time.time() + 2.0
-        while len(self.tg.sent_messages) == sent_before + 1 and time.time() < deadline:
+        while len(self.tg.sent_messages) <= sent_before and time.time() < deadline:
             time.sleep(0.02)
-        time.sleep(0.05)
         router_sd.shutdown(timeout_seconds=2.0)
         t.join(timeout=2.0)
         self.assertEqual(sd_out["res"]["decision"], "deny")
+
+        # 5. Post-shutdown approval request is rejected atomically without sending a prompt
+        sent_after_sd = len(self.tg.sent_messages)
+        res_post_sd = router_sd.approvals.request_approval(
+            chat_id="111", thread_id=0, tool_name="run_command", tool_args={"CommandLine": "id"}
+        )
+        self.assertEqual(res_post_sd["decision"], "deny")
+        self.assertEqual(len(self.tg.sent_messages), sent_after_sd)
 
     def test_hook_approve_script_allows_ssh_and_fails_closed_for_bridge(self) -> None:
         script = Path(__file__).resolve().parent.parent / "server" / "hook_approve.py"
@@ -840,6 +835,22 @@ class BridgeTestCase(unittest.TestCase):
         )
         self.assertEqual(proc_bridge.returncode, 0)
         self.assertEqual(json.loads(proc_bridge.stdout)["decision"], "deny")
+
+        # Bridge session: vetted read-only tool -> allow; unknown/MCP tool -> fail-closed deny
+        ro_in = json.dumps({"conversationId": "conv-1", "toolCall": {"name": "view_file", "args": {"AbsolutePath": "/tmp/a"}}})
+        proc_ro = subprocess.run([sys.executable, str(script)], input=ro_in, text=True, capture_output=True, env=env_bridge, timeout=10)
+        self.assertEqual(json.loads(proc_ro.stdout)["decision"], "allow")
+
+        mcp_in = json.dumps({"conversationId": "conv-1", "toolCall": {"name": "mcp_drop_table", "args": {}}})
+        proc_mcp = subprocess.run([sys.executable, str(script)], input=mcp_in, text=True, capture_output=True, env=env_bridge, timeout=10)
+        self.assertEqual(json.loads(proc_mcp.stdout)["decision"], "deny")
+
+        # Non-loopback BRIDGE_IPC_HOST must be rejected fail-closed
+        env_bad_host = dict(env_bridge)
+        env_bad_host["BRIDGE_IPC_HOST"] = "192.168.1.50"
+        proc_bad = subprocess.run([sys.executable, str(script)], input=sample_in, text=True, capture_output=True, env=env_bad_host, timeout=10)
+        self.assertEqual(json.loads(proc_bad.stdout)["decision"], "deny")
+        self.assertIn("non-loopback", json.loads(proc_bad.stdout)["reason"].lower())
 
     def test_sd_notify_datagrams_and_unset_noop(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -902,6 +913,77 @@ class BridgeTestCase(unittest.TestCase):
             self.assertEqual(mock_tg.sent_messages[-1]["text"], "Fallback **raw**")
         finally:
             mock_tg.close()
+
+        # Nested inline code inside Markdown link & triple-asterisk bold-italic
+        nested = "See [`server/bot.py`](https://example.com/bot) and ***important***"
+        nested_html = markdown_to_telegram_html(nested)
+        self.assertNotIn("\x00TGPH", nested_html)
+        self.assertIn('<a href="https://example.com/bot"><code>server/bot.py</code></a>', nested_html)
+        self.assertIn("<b><i>important</i></b>", nested_html)
+
+    def test_review_hardening_payload_attachments_muted_recovery_and_url_validation(self) -> None:
+        # 1. Strict TELEGRAM_API_BASE_URL validation
+        for bad_url in (
+            "https://api.telegram.org?x=1",
+            "https://user@api.telegram.org",
+            "https://api.telegram.org:8443",
+            "http://127.0.0.1:abc",
+            "https://evil.example.com",
+        ):
+            with self.assertRaises(ValueError, msg=f"Should reject {bad_url}"):
+                validate_telegram_api_base_url(bad_url)
+
+        # 2. Long run_command & file write attach full untruncated payload via send_document
+        cfg_short = BridgeConfig(**{**self.cfg.__dict__, "approval_timeout_seconds": 0.1})
+        router = BridgeRouter(cfg_short, self.store, FakeRunner([]), self.tg)  # type: ignore[arg-type]
+        long_cmd = "echo start && " + ("x" * 1300) + " && echo hidden_tail"
+        router.approvals.request_approval(
+            chat_id="111", thread_id=0, tool_name="run_command", tool_args={"CommandLine": long_cmd}
+        )
+        self.assertEqual(len(self.tg.sent_documents), 1)
+        self.assertIn("hidden_tail", self.tg.sent_documents[0]["content"])
+
+        router.approvals.request_approval(
+            chat_id="111",
+            thread_id=0,
+            tool_name="write_to_file",
+            tool_args={"TargetFile": "/tmp/a.py", "CodeContent": "print('visible_content')"},
+        )
+        self.assertIn("visible_content", self.tg.sent_messages[-1]["text"])
+
+        # 3. /mirror muted still recovers stranded Telegram-originated replies while muting SSH turns
+        conv_id = "conv-muted-recover"
+        b = self.store.get_or_create_binding("telegram", "111", 0, "private", str(self.workspace))
+        self.store.set_conversation_id(b.id, conv_id)
+        self.store.set_mirror_mode(b.id, "muted")
+        self._write_transcript(
+            conv_id,
+            [
+                {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "<USER_REQUEST>\nssh secret prompt\n</USER_REQUEST>"},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "ssh muted reply"},
+                {"step_index": 2, "type": "USER_INPUT", "status": "DONE", "content": "<USER_REQUEST>\n[channel: telegram | time: 2026-11-26]\nhello\n</USER_REQUEST>"},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "stranded_telegram_reply"},
+            ],
+        )
+        sent_before = len(self.tg.sent_messages)
+        reconciled = router.recover_after_startup(unclean_exit=False)
+        self.assertEqual(reconciled, 1)
+        delivered = [m["text"] for m in self.tg.sent_messages[sent_before:]]
+        self.assertEqual(delivered, ["stranded_telegram_reply"])
+
+        # 4. Shutdown skips Stage-2 agent recovery turn
+        runner = FakeRunner([AgyResult(conversation_id=conv_id, status="SUCCESS", response="should_not_run")])
+        router_sd = BridgeRouter(cfg_short, self.store, runner, self.tg)  # type: ignore[arg-type]
+        router_sd.begin_shutdown()
+        fallback = router_sd._recover_failed_turn(
+            binding=b,
+            user_message="run cmd",
+            result=AgyResult(conversation_id=conv_id, status="SUCCESS", response=""),
+            conv_id=conv_id,
+            pre_turn_step=3,
+        )
+        self.assertEqual(len(runner.calls), 0)
+        self.assertIn("Turn could not complete", fallback)
 
 
 if __name__ == "__main__":

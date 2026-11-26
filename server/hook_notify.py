@@ -32,27 +32,9 @@ def _notify_bridge(event: str) -> None:
     if not isinstance(payload, dict):
         return
 
-    from server.config import parse_dotenv
+    from server.config import load_ipc_client_settings
 
-    env_override = os.environ.get("BRIDGE_ENV_FILE")
-    env_path = Path(env_override) if env_override else (REPO_ROOT / ".env")
-    env_vals = parse_dotenv(env_path)
-    ipc_host = (
-        os.environ.get("BRIDGE_IPC_HOST") or env_vals.get("BRIDGE_IPC_HOST") or "127.0.0.1"
-    ).strip()
-    ipc_port = int(
-        (os.environ.get("BRIDGE_IPC_PORT") or env_vals.get("BRIDGE_IPC_PORT") or "8765").strip()
-    )
-    db_path = Path(
-        os.environ.get("BRIDGE_DB_PATH")
-        or env_vals.get("BRIDGE_DB_PATH")
-        or str(REPO_ROOT / "data" / "bridge.db")
-    )
-    token_path = Path(
-        os.environ.get("BRIDGE_IPC_TOKEN_PATH")
-        or env_vals.get("BRIDGE_IPC_TOKEN_PATH")
-        or str(db_path.parent / "ipc.token")
-    )
+    url_host, ipc_port, token_path, _approval_timeout = load_ipc_client_settings(REPO_ROOT)
     if not token_path.exists():
         return
     ipc_token = token_path.read_text(encoding="utf-8").strip()
@@ -70,7 +52,7 @@ def _notify_bridge(event: str) -> None:
         }
     ).encode("utf-8")
     req = urllib.request.Request(
-        f"http://{ipc_host}:{ipc_port}/hook",
+        f"http://{url_host}:{ipc_port}/hook",
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -78,7 +60,8 @@ def _notify_bridge(event: str) -> None:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=3):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=3):
         pass
 
 

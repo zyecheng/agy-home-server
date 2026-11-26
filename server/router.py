@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agy_runner import AgyResult, AgyRunner, format_channel_envelope
-from .approvals import ApprovalManager, DEFAULT_APPROVAL_TIMEOUT_SECONDS
+from .approvals import ApprovalManager
 from .config import VALID_MIRROR_MODES, BridgeConfig
 from .db import Binding, BridgeStore
 from .failure_analyzer import (
@@ -58,8 +58,6 @@ class BridgeRouter:
         store: BridgeStore,
         runner: AgyRunner,
         telegram: TelegramClient,
-        *,
-        approval_timeout_seconds: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
         self.store = store
@@ -67,7 +65,7 @@ class BridgeRouter:
         self.telegram = telegram
         self.approvals = ApprovalManager(
             telegram,
-            timeout_seconds=approval_timeout_seconds,
+            timeout_seconds=config.approval_timeout_seconds,
         )
 
         # Locks keyed by normalized endpoint (channel, chat_id, thread_id) so
@@ -118,10 +116,24 @@ class BridgeRouter:
         t.start()
         return t
 
-    def shutdown(self, timeout_seconds: float = 35.0) -> None:
-        """Fail-close pending approvals, cancel timers, flush debounce batches, and join workers."""
+    def begin_shutdown(self) -> None:
+        """Immediately mark shutting down and fail-close any waiting tool approvals."""
         self._shutting_down.set()
         self.approvals.cancel_all()
+
+    def start_startup_recovery(self, *, unclean_exit: bool) -> threading.Thread:
+        """Run startup transcript reconciliation asynchronously so READY=1 is never blocked."""
+        return self._spawn_worker(self._run_startup_recovery, (unclean_exit,))
+
+    def _run_startup_recovery(self, unclean_exit: bool) -> None:
+        try:
+            self.recover_after_startup(unclean_exit=unclean_exit)
+        except Exception:
+            log.exception("Startup recovery failed; continuing daemon operation")
+
+    def shutdown(self, timeout_seconds: float = 35.0) -> None:
+        """Fail-close pending approvals, cancel timers, flush debounce batches, and join workers."""
+        self.begin_shutdown()
         pending_to_flush: list[list[InboundMessage]] = []
         with self._debounce_guard:
             for _gen, timer in self._debounce_timers.values():
@@ -264,20 +276,27 @@ class BridgeRouter:
 
         cb_id = str(cb.get("id") or "")
         cb_data = str(cb.get("data") or "")
+        raw_msg_id = msg.get("message_id")
+        cb_msg_id = int(raw_msg_id) if raw_msg_id is not None else None
         if not cb_data:
             return
         self._spawn_worker(
             self._resolve_approval_callback,
-            (str(chat_id), cb_id, cb_data),
+            (str(chat_id), cb_id, cb_data, cb_msg_id),
         )
 
     def _resolve_approval_callback(
-        self, chat_id: str, callback_query_id: str, callback_data: str
+        self,
+        chat_id: str,
+        callback_query_id: str,
+        callback_data: str,
+        message_id: int | None = None,
     ) -> None:
         self.approvals.resolve_callback(
             chat_id=chat_id,
             callback_query_id=callback_query_id,
             callback_data=callback_data,
+            message_id=message_id,
         )
 
     def enqueue_inbound(self, msg: InboundMessage) -> None:
@@ -544,8 +563,8 @@ class BridgeRouter:
             diag.attempted_tools,
         )
 
-        # Skip Stage-2 agent recovery when there is no conversation_id yet (avoids orphan conversations)
-        if diag.recoverable_via_agent and conv_id:
+        # Skip Stage-2 agent recovery when shutting down or when no conversation_id exists yet
+        if diag.recoverable_via_agent and conv_id and not self._shutting_down.is_set():
             recovery_prompt = build_recovery_prompt(
                 user_message, diag, timezone_name=self.config.timezone_name
             )
@@ -856,10 +875,6 @@ class BridgeRouter:
         if not new_steps:
             return 0
 
-        if binding.mirror_mode == "muted":
-            self.store.update_watermark(binding.id, max(s.step_index for s in new_steps))
-            return 0
-
         sent = 0
         pending_user: str | None = None
         last_user_from_bridge = False
@@ -873,6 +888,13 @@ class BridgeRouter:
                     and new_steps[idx + 1].step_type == "PLANNER_RESPONSE"
                 )
                 if next_is_planner:
+                    continue
+
+                # /mirror muted suppresses SSH mirroring only; stranded bridge/Telegram replies still recover
+                if not last_user_from_bridge and binding.mirror_mode == "muted":
+                    self.store.update_watermark(binding.id, step.step_index)
+                    pending_user = None
+                    last_user_from_bridge = False
                     continue
 
                 if not last_user_from_bridge and binding.mirror_mode == "full" and pending_user:
@@ -929,32 +951,35 @@ class BridgeRouter:
                     "Startup transcript reconciliation failed for binding=%s", binding.id
                 )
 
-        if unclean_exit:
-            log.warning(
-                "Detected previous unclean shutdown (reconciled_messages=%d)", reconciled
+        if not unclean_exit:
+            return reconciled
+        log.warning(
+            "Detected previous unclean shutdown (reconciled_messages=%d)", reconciled
+        )
+        if not self.telegram.configured:
+            return reconciled
+        primary = self.store.get_primary_dm_binding("telegram")
+        if primary is None:
+            return reconciled
+        if reconciled > 0:
+            notice = (
+                f"[System] Bridge recovered from an unexpected restart and "
+                f"delivered {reconciled} pending message(s)."
             )
-            if self.telegram.configured:
-                primary = self.store.get_primary_dm_binding("telegram")
-                if primary is not None:
-                    if reconciled > 0:
-                        notice = (
-                            f"[System] Bridge recovered from an unexpected restart and "
-                            f"delivered {reconciled} pending message(s)."
-                        )
-                    else:
-                        notice = (
-                            "[System] Bridge recovered from an unexpected restart. "
-                            "If a message was in flight when it exited, please re-send it."
-                        )
-                    try:
-                        self.telegram.send_message(
-                            primary.chat_id,
-                            notice,
-                            thread_id=primary.thread_id,
-                            disable_notification=True,
-                        )
-                    except Exception:
-                        log.exception("Failed sending unclean-restart notice to primary DM")
+        else:
+            notice = (
+                "[System] Bridge recovered from an unexpected restart. "
+                "If a message was in flight when it exited, please re-send it."
+            )
+        try:
+            self.telegram.send_message(
+                primary.chat_id,
+                notice,
+                thread_id=primary.thread_id,
+                disable_notification=True,
+            )
+        except Exception:
+            log.exception("Failed sending unclean-restart notice to primary DM")
         return reconciled
 
     def handle_watcher_event(self, payload: dict) -> dict:

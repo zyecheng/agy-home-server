@@ -32,7 +32,7 @@ PrivateTmp=yes
 UMask=0077
 ProtectSystem=strict
 ReadWritePaths=/home/agy/agy-server/data /home/agy/alpha-assistant /home/agy/.gemini/antigravity-cli
-ReadOnlyPaths=/home/agy/agy-server /home/agy/alpha-assistant/.agents/hooks.json /home/agy/alpha-assistant/GEMINI.md
+ReadOnlyPaths=/home/agy/agy-server /home/agy/alpha-assistant/.agents /home/agy/alpha-assistant/GEMINI.md -/home/agy/.gemini/antigravity-cli/settings.json
 InaccessiblePaths=/home/agy/.ssh
 
 [Install]

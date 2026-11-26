@@ -11,6 +11,7 @@ import re
 _FENCE_RE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`([^`\r\n]+)`")
 _LINK_RE = re.compile(r"\[([^\]\r\n]+)\]\((https?://[^\s)\"<>]+|tg://[^\s)\"<>]+)\)")
+_BOLD_ITALIC_STAR_RE = re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*")
 _BOLD_STAR_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _BOLD_UNDER_RE = re.compile(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)")
 _STRIKE_RE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
@@ -94,14 +95,15 @@ def markdown_to_telegram_html(text: str) -> str:
     _flush_quote()
     work = "\n".join(out_lines)
 
-    # 6. Inline emphasis transforms
+    # 6. Inline emphasis transforms (triple-star bold-italic before bold/italic)
+    work = _BOLD_ITALIC_STAR_RE.sub(r"<b><i>\1</i></b>", work)
     work = _BOLD_STAR_RE.sub(r"<b>\1</b>", work)
     work = _BOLD_UNDER_RE.sub(r"<b>\1</b>", work)
     work = _STRIKE_RE.sub(r"<s>\1</s>", work)
     work = _ITALIC_STAR_RE.sub(r"<i>\1</i>", work)
 
-    # 7. Restore code & link placeholders
-    for idx, rendered in enumerate(placeholders):
-        work = work.replace(f"\x00TGPH{idx}\x00", rendered)
+    # 7. Restore placeholders in reverse index order so nested tokens (e.g. code inside links) expand
+    for idx in range(len(placeholders) - 1, -1, -1):
+        work = work.replace(f"\x00TGPH{idx}\x00", placeholders[idx])
 
     return work

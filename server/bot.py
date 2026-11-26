@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .agy_runner import AgyRunner
-from .config import BridgeConfig, ensure_ipc_token
+from .config import BridgeConfig, ensure_ipc_token, resolve_env_file
 from .db import BridgeStore
 from .router import BridgeRouter
 from .telegram_client import BOT_COMMANDS, TelegramClient
@@ -135,12 +135,8 @@ def start_ipc_server(
 
 
 def main() -> int:
-    env_override = os.environ.get("BRIDGE_ENV_FILE")
-    env_file: Path | None
-    if env_override is not None:
-        env_file = Path(env_override) if env_override.strip() else None
-    else:
-        env_file = Path(__file__).resolve().parent.parent / ".env"
+    repo_root = Path(__file__).resolve().parent.parent
+    env_file = resolve_env_file(repo_root)
     config = BridgeConfig.from_env(env_file)
     ipc_token = ensure_ipc_token(config.ipc_token_path)
     store = BridgeStore(config.db_path)
@@ -150,13 +146,7 @@ def main() -> int:
         max_inline_chars=config.max_inline_chars,
         api_base_url=config.telegram_api_base_url,
     )
-    router = BridgeRouter(
-        config,
-        store,
-        runner,
-        telegram,
-        approval_timeout_seconds=config.approval_timeout_seconds,
-    )
+    router = BridgeRouter(config, store, runner, telegram)
     stop_event = threading.Event()
     clean_exit = False
 
@@ -167,19 +157,24 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sig)
     signal.signal(signal.SIGINT, _handle_sig)
 
+    # Immediately fail-close approvals on SIGTERM without waiting for an active getUpdates poll
+    def _shutdown_watcher() -> None:
+        stop_event.wait()
+        router.begin_shutdown()
+
+    threading.Thread(target=_shutdown_watcher, daemon=True).start()
+
     ipc = start_ipc_server(config, router, ipc_token)
 
     try:
-        # Track unclean restarts via kv_state and reconcile any finished-but-undelivered turns
+        # Mark running state and notify systemd READY=1 BEFORE any network calls
         prev_clean = store.get_kv("clean_shutdown", "")
         unclean_exit = prev_clean == "0"
         store.set_kv("clean_shutdown", "0")
-        try:
-            router.recover_after_startup(unclean_exit=unclean_exit)
-        except Exception:
-            log.exception("Startup recovery failed; continuing daemon startup")
-
         sd_notify("READY=1")
+
+        # Run startup reconciliation asynchronously so a boot WAN outage never blocks READY=1
+        router.start_startup_recovery(unclean_exit=unclean_exit)
 
         if not telegram.configured:
             log.info(
@@ -193,16 +188,21 @@ def main() -> int:
             clean_exit = True
             return 0
 
-        try:
-            telegram.set_my_commands(BOT_COMMANDS)
-            log.info("Registered %d Telegram bot slash commands", len(BOT_COMMANDS))
-        except Exception as exc:
-            log.warning("Could not register Telegram slash commands: %s", exc)
+        # Register slash commands in background so degraded WAN at boot never delays polling/watchdog
+        def _register_commands() -> None:
+            try:
+                telegram.set_my_commands(BOT_COMMANDS)
+                log.info("Registered %d Telegram bot slash commands", len(BOT_COMMANDS))
+            except Exception as exc:
+                log.warning("Could not register Telegram slash commands: %s", exc)
+
+        threading.Thread(target=_register_commands, daemon=True).start()
 
         offset = int(store.get_kv("telegram_offset", "0") or "0")
         log.info(
-            "Starting Telegram long-polling (offset=%d, mirror_default=%s, max_inline=%d)",
+            "Starting Telegram long-polling (offset=%d, poll_timeout=%ds, mirror_default=%s, max_inline=%d)",
             offset,
+            config.poll_timeout_seconds,
             config.default_mirror_mode,
             config.max_inline_chars,
         )
@@ -232,10 +232,10 @@ def main() -> int:
         clean_exit = True
     finally:
         sd_notify("STOPPING=1")
-        router.approvals.cancel_all()
+        router.begin_shutdown()
         ipc.shutdown()
         ipc.server_close()
-        router.shutdown(timeout_seconds=35.0)
+        router.shutdown(timeout_seconds=25.0)
         if clean_exit:
             try:
                 store.set_kv("clean_shutdown", "1")

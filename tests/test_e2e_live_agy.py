@@ -51,13 +51,16 @@ class Tier2LiveAgyE2ETest(unittest.TestCase):
                 "AGY_TIMEOUT_SECONDS": "120",
             },
         )
-        # Copy real Alpha persona & real hooks.json into the isolated temp workspace
+        # Copy real Alpha persona & real hooks.json (rewriting checkout path to REPO_ROOT)
         ws_agents = self.bot.workspace / ".agents"
         ws_agents.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO_ROOT / "alpha-workspace" / "GEMINI.md", self.bot.workspace / "GEMINI.md")
-        shutil.copy2(
-            REPO_ROOT / "alpha-workspace" / ".agents" / "hooks.json",
-            ws_agents / "hooks.json",
+        hooks_text = (REPO_ROOT / "alpha-workspace" / ".agents" / "hooks.json").read_text(
+            encoding="utf-8"
+        )
+        (ws_agents / "hooks.json").write_text(
+            hooks_text.replace("/home/agy/agy-server", str(REPO_ROOT)),
+            encoding="utf-8",
         )
         self.bot.start(timeout=15.0)
 

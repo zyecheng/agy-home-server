@@ -20,13 +20,59 @@ def validate_telegram_api_base_url(raw: str) -> str:
     """Allow only official Telegram API HTTPS or loopback HTTP (for local E2E tests)."""
     url = (raw or DEFAULT_TELEGRAM_API_BASE_URL).strip().rstrip("/")
     parsed = urlparse(url)
-    if parsed.scheme == "https" and parsed.hostname == "api.telegram.org" and not parsed.path:
+    if parsed.params or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError(
+            f"Refusing TELEGRAM_API_BASE_URL '{url}'; must not include userinfo, query, or fragment"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in TELEGRAM_API_BASE_URL '{url}'") from exc
+    if (
+        parsed.scheme == "https"
+        and parsed.hostname == "api.telegram.org"
+        and not parsed.path
+        and port in (None, 443)
+    ):
         return url
     if parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS and not parsed.path:
         return url
     raise ValueError(
         f"Refusing TELEGRAM_API_BASE_URL '{url}'; must be https://api.telegram.org or loopback http://"
     )
+
+
+def resolve_env_file(repo_root: Path) -> Path | None:
+    """Resolve optional BRIDGE_ENV_FILE consistently across daemon and hook scripts."""
+    env_override = os.environ.get("BRIDGE_ENV_FILE")
+    if env_override is not None:
+        return Path(env_override) if env_override.strip() else None
+    return repo_root / ".env"
+
+
+def load_ipc_client_settings(repo_root: Path) -> tuple[str, int, Path, float]:
+    """Load validated loopback IPC settings for hook scripts (host_for_url, port, token_path, approval_timeout)."""
+    env_file = resolve_env_file(repo_root)
+    env_vals = parse_dotenv(env_file) if env_file is not None else {}
+
+    def _get(key: str, default: str) -> str:
+        val = os.environ.get(key)
+        if val is not None and val != "":
+            return val.strip()
+        fval = env_vals.get(key)
+        if fval is not None and fval != "":
+            return fval.strip()
+        return default
+
+    ipc_host = _get("BRIDGE_IPC_HOST", "127.0.0.1")
+    if ipc_host not in _LOOPBACK_HOSTS:
+        raise ValueError(f"Refusing non-loopback BRIDGE_IPC_HOST '{ipc_host}'; must be loopback")
+    url_host = f"[{ipc_host}]" if ":" in ipc_host else ipc_host
+    ipc_port = int(_get("BRIDGE_IPC_PORT", "8765"))
+    db_path = Path(_get("BRIDGE_DB_PATH", str(repo_root / "data" / "bridge.db")))
+    token_path = Path(_get("BRIDGE_IPC_TOKEN_PATH", str(db_path.parent / "ipc.token")))
+    approval_timeout = max(0.05, _parse_float(_get("APPROVAL_TIMEOUT_SECONDS", "120"), 120.0))
+    return url_host, ipc_port, token_path, approval_timeout
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -153,7 +199,7 @@ class BridgeConfig:
             telegram_bot_token=get("TELEGRAM_BOT_TOKEN", "").strip(),
             allowed_user_ids=_parse_int_set(get("TELEGRAM_ALLOWED_USER_IDS", "")),
             allowed_chat_ids=_parse_int_set(get("TELEGRAM_ALLOWED_CHAT_IDS", "")),
-            poll_timeout_seconds=_parse_int(get("POLL_TIMEOUT_SECONDS", "30"), 30),
+            poll_timeout_seconds=_parse_int(get("POLL_TIMEOUT_SECONDS", "15"), 15),
             debounce_seconds=_parse_float(get("DEBOUNCE_SECONDS", "1.5"), 1.5),
             max_inline_chars=max(500, _parse_int(get("MAX_INLINE_CHARS", "3500"), 3500)),
             ssh_prompt_preview_chars=max(

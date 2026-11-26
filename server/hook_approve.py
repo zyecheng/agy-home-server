@@ -6,10 +6,11 @@
 
 - For manual SSH / non-bridge sessions (`AGY_BRIDGE_ORIGIN != "bridge"`), returns
   `{"decision": "allow"}` immediately so normal interactive TUI prompts apply.
-- For bridge-driven headless runs (`AGY_BRIDGE_ORIGIN == "bridge"`), forwards the
-  proposed tool call to the authenticated local bridge (`POST /approve`) and waits
-  for the user's Telegram button tap.
-- STRICTLY FAIL-CLOSED: any error, missing token, or timeout returns `deny`.
+- For bridge-driven headless runs (`AGY_BRIDGE_ORIGIN == "bridge"`):
+  - Vetted read-only local tools pass through with `allow` (still governed by agy policy).
+  - All other tools (including unlisted or future MCP tools) forward to the
+    authenticated localhost bridge (`POST /approve`) for Telegram button approval.
+- STRICTLY FAIL-CLOSED: any error, missing token, non-loopback host, or timeout returns `deny`.
 """
 
 from __future__ import annotations
@@ -23,6 +24,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+# Explicit allowlist of vetted read-only local inspection tools.
+# Every other tool (shell, file writes, web/network, tasks, schedules, MCP, future tools)
+# requires explicit Telegram approval.
+SAFE_READ_ONLY_TOOLS = frozenset(
+    {
+        "view_file",
+        "read_file",
+        "list_dir",
+        "find_by_name",
+        "grep_search",
+        "list_permissions",
+    }
+)
 
 
 def _emit(decision: str, reason: str = "") -> int:
@@ -49,35 +64,16 @@ def main() -> int:
             return _emit("deny", "Missing toolCall in PreToolUse payload (fail-closed).")
 
         tool_name = str(tool_call.get("name") or "").strip()
+        if not tool_name:
+            return _emit("deny", "Missing tool name in PreToolUse payload (fail-closed).")
+        if tool_name in SAFE_READ_ONLY_TOOLS:
+            return _emit("allow")
+
         tool_args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
 
-        from server.config import parse_dotenv
+        from server.config import load_ipc_client_settings
 
-        env_override = os.environ.get("BRIDGE_ENV_FILE")
-        env_path = Path(env_override) if env_override else (REPO_ROOT / ".env")
-        env_vals = parse_dotenv(env_path)
-        ipc_host = (
-            os.environ.get("BRIDGE_IPC_HOST")
-            or env_vals.get("BRIDGE_IPC_HOST")
-            or "127.0.0.1"
-        ).strip()
-        ipc_port = int(
-            (
-                os.environ.get("BRIDGE_IPC_PORT")
-                or env_vals.get("BRIDGE_IPC_PORT")
-                or "8765"
-            ).strip()
-        )
-        db_path = Path(
-            os.environ.get("BRIDGE_DB_PATH")
-            or env_vals.get("BRIDGE_DB_PATH")
-            or str(REPO_ROOT / "data" / "bridge.db")
-        )
-        token_path = Path(
-            os.environ.get("BRIDGE_IPC_TOKEN_PATH")
-            or env_vals.get("BRIDGE_IPC_TOKEN_PATH")
-            or str(db_path.parent / "ipc.token")
-        )
+        url_host, ipc_port, token_path, approval_timeout = load_ipc_client_settings(REPO_ROOT)
         if not token_path.exists():
             return _emit("deny", "Bridge IPC token unavailable (fail-closed).")
         ipc_token = token_path.read_text(encoding="utf-8").strip()
@@ -93,7 +89,7 @@ def main() -> int:
         ).encode("utf-8")
 
         req = urllib.request.Request(
-            f"http://{ipc_host}:{ipc_port}/approve",
+            f"http://{url_host}:{ipc_port}/approve",
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -101,7 +97,9 @@ def main() -> int:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=128) as resp:
+        # Never route localhost IPC through ambient HTTP_PROXY variables
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=max(10.0, approval_timeout + 8.0)) as resp:
             result = json.loads(resp.read().decode("utf-8"))
 
         decision = str(result.get("decision") or "deny")
