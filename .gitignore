@@ -3,6 +3,7 @@
 
 .env
 data/
+watcher-ipc/
 vm/*.ova
 vm/*.iso
 vm/*.exe

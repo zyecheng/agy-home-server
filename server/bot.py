@@ -51,7 +51,11 @@ def sd_notify(state: str) -> bool:
 
 
 def start_ipc_server(
-    config: BridgeConfig, router: BridgeRouter, ipc_token: str
+    config: BridgeConfig,
+    router: BridgeRouter,
+    ipc_token: str,
+    *,
+    watcher_token: str | None = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
@@ -65,9 +69,17 @@ def start_ipc_server(
             self.end_headers()
             self.wfile.write(raw)
 
-        def _is_authenticated(self) -> bool:
+        def _is_ipc_authenticated(self) -> bool:
             presented = self.headers.get("X-Bridge-Token", "")
             return bool(presented) and hmac.compare_digest(presented, ipc_token)
+
+        def _is_watcher_authenticated(self) -> bool:
+            presented = self.headers.get("X-Bridge-Token", "")
+            if not presented:
+                return False
+            if watcher_token and hmac.compare_digest(presented, watcher_token):
+                return True
+            return hmac.compare_digest(presented, ipc_token)
 
         def do_GET(self) -> None:
             if self.path == "/health":
@@ -84,9 +96,14 @@ def start_ipc_server(
             self._send_json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
-            if not self._is_authenticated():
-                self._send_json(401, {"error": "unauthorized"})
-                return
+            if self.path == "/watcher":
+                if not self._is_watcher_authenticated():
+                    self._send_json(401, {"error": "unauthorized"})
+                    return
+            else:
+                if not self._is_ipc_authenticated():
+                    self._send_json(401, {"error": "unauthorized"})
+                    return
 
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if ctype != "application/json":
@@ -122,7 +139,25 @@ def start_ipc_server(
                 return
             if self.path == "/watcher":
                 res = router.handle_watcher_event(payload)
-                code = 200 if res.get("status") != "error" else 400
+                st = res.get("status")
+                if st == "shutting_down":
+                    code = 503
+                elif st == "error":
+                    code = 400
+                elif st == "failed":
+                    code = 502
+                else:
+                    code = 200
+                self._send_json(code, res)
+                return
+            if self.path == "/watcher/topic":
+                res = router.handle_watcher_topic_request(payload)
+                if res.get("ok"):
+                    code = 200
+                elif res.get("error") == "rate_limited":
+                    code = 429
+                else:
+                    code = 400
                 self._send_json(code, res)
                 return
             self._send_json(404, {"error": "not_found"})
@@ -139,6 +174,8 @@ def main() -> int:
     env_file = resolve_env_file(repo_root)
     config = BridgeConfig.from_env(env_file)
     ipc_token = ensure_ipc_token(config.ipc_token_path)
+    watcher_token = ensure_ipc_token(config.watcher_token_path)
+    config.export_watcher_env()
     store = BridgeStore(config.db_path)
     runner = AgyRunner(config)
     telegram = TelegramClient(
@@ -157,14 +194,14 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sig)
     signal.signal(signal.SIGINT, _handle_sig)
 
-    # Immediately fail-close approvals on SIGTERM without waiting for an active getUpdates poll
+    # Immediately fail-close approvals & terminate in-flight Stage-2 watcher turns on SIGTERM
     def _shutdown_watcher() -> None:
         stop_event.wait()
         router.begin_shutdown()
 
     threading.Thread(target=_shutdown_watcher, daemon=True).start()
 
-    ipc = start_ipc_server(config, router, ipc_token)
+    ipc = start_ipc_server(config, router, ipc_token, watcher_token=watcher_token)
 
     try:
         # Mark running state and notify systemd READY=1 BEFORE any network calls

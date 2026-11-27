@@ -1,0 +1,34 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
+[Unit]
+Description=Antigravity Proactive Watchers & Quarantined Intel Scout Runner
+After=network-online.target agy-telegram.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=agy
+WorkingDirectory=/home/agy/agy-server
+Environment="PATH=/home/agy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="BRIDGE_ENV_FILE=/home/agy/agy-server/watcher-ipc/watcher.env"
+ExecStart=/usr/bin/python3 -m server.watchers.runner
+TimeoutStartSec=540
+StandardOutput=journal
+StandardError=journal
+
+# Strict CaMeL isolation: zero visibility into .env, data/ (bridge.db, backups, ipc.token), memory/, inbox/, or SSH keys
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+UMask=0077
+ProtectSystem=strict
+InaccessiblePaths=/home/agy/.ssh -/home/agy/agy-server/.env /home/agy/agy-server/data /home/agy/alpha-assistant/memory /home/agy/alpha-assistant/inbox
+ReadOnlyPaths=/home/agy/agy-server /home/agy/agy-server/watcher-ipc /home/agy/alpha-assistant/watchers/missions /home/agy/agy-scout-sandbox -/home/agy/.gemini/antigravity-cli/settings.json
+ReadWritePaths=/home/agy/alpha-assistant/watchers/state /home/agy/alpha-assistant/watchers/triggers /home/agy/.gemini/antigravity-cli
+IPAddressDeny=0.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 224.0.0.0/4 fc00::/7 fe80::/10 ff00::/8 64:ff9b::/96 64:ff9b:1::/48

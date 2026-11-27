@@ -53,6 +53,7 @@ class MockTelegramServer:
 
         self._next_update_id = 1000
         self._next_message_id = 1
+        self._next_thread_id = 500
         self._updates: list[dict] = []
         self._faults: dict[str, deque[dict]] = {}
 
@@ -62,6 +63,9 @@ class MockTelegramServer:
         self.answered_callbacks: list[dict] = []
         self.chat_actions: list[dict] = []
         self.registered_commands: list[dict] = []
+        self.created_topics: list[dict] = []
+        self.closed_topics: list[dict] = []
+        self.reopened_topics: list[dict] = []
         self.get_updates_calls: list[dict] = []
         self.get_file_calls: list[str] = []
         self.faults_triggered: list[dict] = []
@@ -219,6 +223,40 @@ class MockTelegramServer:
                     )
                     return
 
+                if method == "createForumTopic":
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                    with mock_self._record_cond:
+                        tid = mock_self._next_thread_id
+                        mock_self._next_thread_id += 1
+                        rec = {
+                            "chat_id": int(payload["chat_id"]),
+                            "name": str(payload.get("name") or ""),
+                            "message_thread_id": tid,
+                        }
+                        mock_self.created_topics.append(rec)
+                        mock_self._record_cond.notify_all()
+                    self._send_json(
+                        200,
+                        {"ok": True, "result": {"message_thread_id": tid, "name": rec["name"]}},
+                    )
+                    return
+
+                if method == "closeForumTopic":
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                    with mock_self._record_cond:
+                        mock_self.closed_topics.append(payload)
+                        mock_self._record_cond.notify_all()
+                    self._send_json(200, {"ok": True, "result": True})
+                    return
+
+                if method == "reopenForumTopic":
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                    with mock_self._record_cond:
+                        mock_self.reopened_topics.append(payload)
+                        mock_self._record_cond.notify_all()
+                    self._send_json(200, {"ok": True, "result": True})
+                    return
+
                 self._send_json(404, {"ok": False, "description": f"Unknown method {method}"})
 
         self._server = _ThreadedHTTPServer(("127.0.0.1", 0), Handler)
@@ -352,6 +390,7 @@ class MockTelegramServer:
                 "text": str(payload.get("text") or ""),
                 "parse_mode": payload.get("parse_mode"),
                 "disable_notification": bool(payload.get("disable_notification", False)),
+                "link_preview_options": payload.get("link_preview_options"),
                 "reply_markup": payload.get("reply_markup"),
                 "ts": time.time(),
             }

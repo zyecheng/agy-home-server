@@ -24,12 +24,22 @@ class FileTooLargeError(ValueError):
 
 BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "status", "description": "Host & conversation status"},
+    {"command": "watches", "description": "List all proactive watch missions"},
+    {"command": "newwatch", "description": "Create a new Mission Topic for a watch task"},
+    {"command": "watch", "description": "Manage a mission (status|pause|resume|run|archive)"},
     {"command": "mirror", "description": "Set SSH mirror mode (full | replies_only | muted)"},
     {"command": "compact", "description": "Compact current conversation context"},
     {"command": "reset", "description": "Archive thread and start a fresh conversation"},
     {"command": "id", "description": "Show chat, thread, and conversation IDs"},
     {"command": "help", "description": "List available commands"},
 ]
+
+
+def build_topic_deep_link(chat_id: str | int, thread_id: int) -> str:
+    """Build a 1-tap Telegram deep link to a Supergroup Forum Topic."""
+    raw = str(chat_id).strip()
+    internal = raw.removeprefix("-100") if raw.startswith("-100") else raw.lstrip("-")
+    return f"https://t.me/c/{internal}/{int(thread_id)}"
 
 
 def build_two_line_preview(text: str, *, max_caption_chars: int = 900) -> str:
@@ -183,6 +193,7 @@ class TelegramClient:
         *,
         thread_id: int = 0,
         disable_notification: bool = False,
+        disable_web_page_preview: bool = False,
         prefix: str = "",
         filename_prefix: str = "alpha-reply",
     ) -> dict:
@@ -194,6 +205,7 @@ class TelegramClient:
                 full_text,
                 thread_id=thread_id,
                 disable_notification=disable_notification,
+                disable_web_page_preview=disable_web_page_preview,
                 markdown=True,
             )
 
@@ -289,6 +301,7 @@ class TelegramClient:
         *,
         thread_id: int = 0,
         disable_notification: bool = False,
+        disable_web_page_preview: bool = False,
         reply_markup: dict | None = None,
         markdown: bool = False,
     ) -> dict:
@@ -307,6 +320,8 @@ class TelegramClient:
             "chat_id": int(chat_id),
             "disable_notification": bool(disable_notification),
         }
+        if disable_web_page_preview:
+            base_payload["link_preview_options"] = {"is_disabled": True}
         if thread_id > 1:
             base_payload["message_thread_id"] = int(thread_id)
         if reply_markup is not None:
@@ -394,4 +409,36 @@ class TelegramClient:
             file_field="document",
             filename=filename,
             file_bytes=content,
+        )
+
+    def create_forum_topic(self, chat_id: str | int, name: str) -> dict:
+        """Create a Forum Topic in a Telegram Supergroup (enforces 128-char Telegram limit)."""
+        clean_name = (name or "Watch Mission").strip()[:128] or "Watch Mission"
+        if not self.configured:
+            return {"ok": True, "dry_run": True, "result": {"message_thread_id": 2, "name": clean_name}}
+        return self._api_json(
+            "createForumTopic",
+            {"chat_id": int(chat_id), "name": clean_name},
+            timeout=20,
+            retries=1,
+        )
+
+    def close_forum_topic(self, chat_id: str | int, thread_id: int) -> dict:
+        if not self.configured:
+            return {"ok": True, "dry_run": True}
+        return self._api_json(
+            "closeForumTopic",
+            {"chat_id": int(chat_id), "message_thread_id": int(thread_id)},
+            timeout=15,
+            retries=1,
+        )
+
+    def reopen_forum_topic(self, chat_id: str | int, thread_id: int) -> dict:
+        if not self.configured:
+            return {"ok": True, "dry_run": True}
+        return self._api_json(
+            "reopenForumTopic",
+            {"chat_id": int(chat_id), "message_thread_id": int(thread_id)},
+            timeout=15,
+            retries=1,
         )

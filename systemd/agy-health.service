@@ -1,0 +1,29 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
+[Unit]
+Description=Antigravity Home Server Health Probe & Daily Online SQLite Backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=agy
+WorkingDirectory=/home/agy/agy-server
+Environment="PATH=/home/agy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/python3 -m server.watchers.health
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+
+# Zero-LLM, read-only code/OAuth access, writable only to data/ (backups + health_state.json)
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+UMask=0077
+ProtectSystem=strict
+InaccessiblePaths=/home/agy/.ssh
+ReadOnlyPaths=/home/agy/agy-server /home/agy/.gemini/antigravity-cli
+ReadWritePaths=/home/agy/agy-server/data

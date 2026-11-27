@@ -833,6 +833,366 @@ class Tier1E2EStressChaosTest(unittest.TestCase):
         self.assertNotIn("Traceback (most recent call last)", self.bot.read_stderr())
         self._check_db_integrity(self.bot.db_path)
 
+    def test_06_watcher_missions_e2e_and_stress(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from server.watchers.schema import atomic_write_json, mission_path, validate_mission
+
+        forum_chat_id = -100777888
+        scout_sandbox = self.root / "scout-sandbox"
+        (scout_sandbox / ".agents").mkdir(parents=True, exist_ok=True)
+        (scout_sandbox / ".agents" / "hooks.json").write_text(
+            json.dumps({"hooks": {"PreToolUse": []}}), encoding="utf-8"
+        )
+        (scout_sandbox / ".agents" / "settings.json").write_text(
+            json.dumps({"trustedWorkspaces": [str(scout_sandbox)]}), encoding="utf-8"
+        )
+
+        # Local mock HTTP feed server for 25 concurrent missions (RSS, GitHub Releases, HTML)
+        feed_routes: dict[str, tuple[int, dict[str, str], bytes]] = {}
+        for i in range(8):
+            marker = "[NO_ALERT_MARKER]" if i == 7 else ("[EXFIL_LINK]" if i == 6 else "")
+            feed_routes[f"/rss/{i}.xml"] = (
+                200,
+                {"ETag": f'"rss-{i}-v1"'},
+                (
+                    f'<?xml version="1.0"?><rss><channel><item>'
+                    f"<guid>g-{i}-1</guid><title>RSS Item {i}</title>"
+                    f"<link>https://feeds.example/rss/{i}</link>"
+                    f"<description>Fresh update {i} {marker}</description>"
+                    f"</item></channel></rss>"
+                ).encode("utf-8"),
+            )
+        for i in range(6):
+            feed_routes[f"/repos/acme/repo{i}/releases?per_page=20"] = (
+                200,
+                {"ETag": f'"gh-{i}-v1"'},
+                json.dumps(
+                    [
+                        {
+                            "tag_name": f"v1.{i}.0",
+                            "name": f"Release v1.{i}.0",
+                            "prerelease": False,
+                            "html_url": f"https://github.example/acme/repo{i}/releases/v1.{i}.0",
+                            "body": f"Changelog for repo{i}",
+                        }
+                    ]
+                ).encode("utf-8"),
+            )
+        for i in range(6):
+            feed_routes[f"/page/{i}"] = (
+                200,
+                {"Content-Type": "text/html"},
+                f"<html><script>var nonce='{i}xyz';</script><body><h1>Portal {i}</h1><p>Open Spots Available</p></body></html>".encode(
+                    "utf-8"
+                ),
+            )
+
+        class FeedHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_GET(self) -> None:
+                entry = feed_routes.get(self.path)
+                if entry is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                code, hdrs, body = entry
+                if hdrs.get("ETag") and self.headers.get("If-None-Match") == hdrs["ETag"]:
+                    self.send_response(304)
+                    self.send_header("ETag", hdrs["ETag"])
+                    self.end_headers()
+                    return
+                self.send_response(code)
+                for k, v in hdrs.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        feed_srv = ThreadingHTTPServer(("127.0.0.1", 0), FeedHandler)
+        feed_base = f"http://127.0.0.1:{feed_srv.server_address[1]}"
+        threading.Thread(target=feed_srv.serve_forever, daemon=True).start()
+
+        try:
+            self.bot = BotProcessHarness(
+                root=self.root,
+                mock_tg=self.tg,
+                agy_bin=FAKE_AGY,
+                debounce_seconds=0.05,
+                extra_env={
+                    "WATCHER_FORUM_CHAT_ID": str(forum_chat_id),
+                    "SCOUT_SANDBOX_DIR": str(scout_sandbox),
+                    "WATCHER_QUIET_START": "00:00",
+                    "WATCHER_QUIET_END": "00:00",  # Quiet hours off for stress run
+                    "MAX_DAILY_WEB_SCOUTS": "20",
+                    "WATCHER_STAGE2_TIMEOUT_SECONDS": "25",
+                },
+            )
+            self.bot.start()
+            assert self.bot.proc is not None
+            pid = self.bot.proc.pid
+            m_start = _proc_metrics(pid)
+
+            # 1. Establish DM binding & test /newwatch (0-LLM Forum Topic creation + deep link)
+            self.tg.push_message(chat_id=111, text="hello dm")
+            self.assertTrue(
+                self.tg.wait_for(lambda: any("hello dm" in m["text"] for m in self.tg.sent_messages), timeout=10.0)
+            )
+
+            before_nw = len(self.tg.sent_messages)
+            self.tg.push_message(chat_id=111, text="/newwatch MV Piano Lessons")
+            ok = self.tg.wait_for(
+                lambda: len(self.tg.created_topics) >= 1
+                and any("https://t.me/c/777888/" in m["text"] for m in self.tg.sent_messages[before_nw:]),
+                timeout=10.0,
+            )
+            self.assertTrue(ok, f"/newwatch failed: {self.tg.sent_messages[before_nw:]}")
+            created_tid = self.tg.created_topics[0]["message_thread_id"]
+
+            # Turn 1 inside new Mission Topic must receive [mission: ...] and [initial_request: ...]
+            before_t1 = len(self.tg.sent_messages)
+            self.tg.push_message(
+                chat_id=forum_chat_id,
+                chat_type="supergroup",
+                thread_id=created_tid,
+                text="weekends preferred, under 5 miles",
+            )
+            ok = self.tg.wait_for(
+                lambda: any(
+                    m["thread_id"] == created_tid and "weekends preferred" in m["text"]
+                    for m in self.tg.sent_messages[before_t1:]
+                ),
+                timeout=10.0,
+            )
+            self.assertTrue(ok, f"Mission Topic Turn 1 failed: {self.tg.sent_messages[before_t1:]}")
+
+            # /watch status, /watch pause, /watch archive inside the topic (no [id] needed!)
+            self.tg.push_message(chat_id=forum_chat_id, chat_type="supergroup", thread_id=created_tid, text="/watch status")
+            self.tg.push_message(chat_id=forum_chat_id, chat_type="supergroup", thread_id=created_tid, text="/watch archive")
+            ok = self.tg.wait_for(
+                lambda: any("Mission: MV Piano Lessons" in m["text"] for m in self.tg.sent_messages)
+                and len(self.tg.closed_topics) >= 1,
+                timeout=10.0,
+            )
+            self.assertTrue(ok, f"/watch status/archive failed: {self.tg.sent_messages}")
+
+            # 2. Seed 25 active missions (8 RSS + 6 GitHub + 6 HTML + 5 web_scout) across Mission Topics
+            missions_dir = self.bot.workspace / "watchers" / "missions"
+            missions_dir.mkdir(parents=True, exist_ok=True)
+            total_missions = 25
+            for i in range(8):
+                tid = 600 + i
+                m = validate_mission(
+                    {
+                        "id": f"stress-rss-{i}",
+                        "title": f"RSS Stress {i}",
+                        "status": "active",
+                        "kind": "rss",
+                        "schedule": {"interval_minutes": 15},
+                        "config": {"url": f"{feed_base}/rss/{i}.xml"},
+                        "notify": {"priority": "normal", "quiet_hours": {"disabled": True}, "target": {"chat_id": str(forum_chat_id), "thread_id": tid}},
+                    }
+                )
+                atomic_write_json(mission_path(missions_dir, m["id"]), missions_dir, m)
+            for i in range(6):
+                tid = 610 + i
+                m = validate_mission(
+                    {
+                        "id": f"stress-gh-{i}",
+                        "title": f"GH Stress {i}",
+                        "status": "active",
+                        "kind": "github_releases",
+                        "schedule": {"interval_minutes": 15},
+                        "config": {"repo": f"acme/repo{i}", "api_base_url": feed_base},
+                        "notify": {"priority": "normal", "quiet_hours": {"disabled": True}, "target": {"chat_id": str(forum_chat_id), "thread_id": tid}},
+                    }
+                )
+                atomic_write_json(mission_path(missions_dir, m["id"]), missions_dir, m)
+            for i in range(6):
+                tid = 620 + i
+                m = validate_mission(
+                    {
+                        "id": f"stress-html-{i}",
+                        "title": f"HTML Stress {i}",
+                        "status": "active",
+                        "kind": "http_diff",
+                        "schedule": {"interval_minutes": 15},
+                        "config": {"url": f"{feed_base}/page/{i}"},
+                        "notify": {"priority": "normal", "quiet_hours": {"disabled": True}, "target": {"chat_id": str(forum_chat_id), "thread_id": tid}},
+                    }
+                )
+                atomic_write_json(mission_path(missions_dir, m["id"]), missions_dir, m)
+            for i in range(5):
+                tid = 630 + i
+                tag = "NO_ALERT_SCOUT" if i == 4 else ("EXFIL_SCOUT" if i == 3 else f"piano {i}")
+                m = validate_mission(
+                    {
+                        "id": f"stress-scout-{i}",
+                        "title": f"Scout Stress {i}",
+                        "status": "active",
+                        "kind": "web_scout",
+                        "schedule": {"interval_minutes": 60},
+                        "config": {"queries": [f"Mountain View {tag}"]},
+                        "notify": {"priority": "normal", "quiet_hours": {"disabled": True}, "target": {"chat_id": str(forum_chat_id), "thread_id": tid}},
+                    }
+                )
+                atomic_write_json(mission_path(missions_dir, m["id"]), missions_dir, m)
+
+            # 3. Run 2 CONCURRENT watcher_runner.py processes (flock contention!) + 8 concurrent interactive DMs!
+            watcher_env_file = self.root / "watcher-ipc" / "watcher.env"
+            self.assertTrue(watcher_env_file.exists(), "bot.py did not export watcher-ipc/watcher.env")
+            runner_env = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith(("TELEGRAM_", "BRIDGE_", "AGY_", "WATCHER_"))
+            }
+            runner_env["BRIDGE_ENV_FILE"] = str(watcher_env_file)
+            runner_env["WATCHER_ALLOW_LOOPBACK_FOR_TESTS"] = "1"
+            runner_env["FAKE_AGY_BRAIN_DIR"] = str(self.bot.brain_dir)
+
+            t0 = time.time()
+            before_stress = len(self.tg.sent_messages)
+
+            p_run1 = subprocess.Popen(
+                [sys.executable, "-m", "server.watchers.runner"],
+                cwd=str(REPO_ROOT),
+                env=runner_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            p_run2 = subprocess.Popen(
+                [sys.executable, "-m", "server.watchers.runner"],
+                cwd=str(REPO_ROOT),
+                env=runner_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # Send 8 interactive DM messages WHILE the 25 watcher missions are executing!
+            for dm_i in range(8):
+                self.tg.push_message(chat_id=111, text=f"concurrent-dm-{dm_i}")
+
+            out1, err1 = p_run1.communicate(timeout=90)
+            out2, err2 = p_run2.communicate(timeout=90)
+            self.assertEqual(p_run1.returncode, 0, f"runner1 failed: {err1}")
+            self.assertEqual(p_run2.returncode, 0, f"runner2 failed: {err2}")
+
+            # Run one more tick so remaining 2 web_scouts (per-tick budget=3) complete too
+            p_run3 = subprocess.run(
+                [sys.executable, "-m", "server.watchers.runner"],
+                cwd=str(REPO_ROOT),
+                env=runner_env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            self.assertEqual(p_run3.returncode, 0, f"runner3 failed: {p_run3.stderr}")
+
+            # Verify all 8 interactive DMs completed cleanly
+            ok = self.tg.wait_for(
+                lambda: all(
+                    any(f"concurrent-dm-{dm_i}" in m["text"] for m in self.tg.sent_messages[before_stress:])
+                    for dm_i in range(8)
+                ),
+                timeout=20.0,
+            )
+            self.assertTrue(ok, "Interactive DMs did not finish during watcher stress")
+
+            # Verify delivered watcher briefs:
+            # 25 missions total minus 2 NO_ALERT missions (stress-rss-7 and stress-scout-4) = 23 briefs!
+            watcher_msgs = [
+                m for m in self.tg.sent_messages[before_stress:] if m["chat_id"] == forum_chat_id
+            ]
+            self.assertEqual(len(watcher_msgs), 23, f"Expected 23 briefs (25 - 2 NO_ALERT), got {len(watcher_msgs)}")
+            # Every watcher brief MUST disable link previews & strip injected evil/tg:// links!
+            for wm in watcher_msgs:
+                self.assertEqual(wm["link_preview_options"], {"is_disabled": True})
+                self.assertNotIn("evil.example", wm["text"])
+                self.assertNotIn("evil2.example", wm["text"])
+                self.assertNotIn("tg://", wm["text"])
+                self.assertNotIn("NO_ALERT", wm["text"])
+
+            # 4. Unchanged second tick MUST produce 0 new watcher messages (ETag 304 + dedupe!)
+            before_tick2 = len(self.tg.sent_messages)
+            p_run4 = subprocess.run(
+                [sys.executable, "-m", "server.watchers.runner", "--force"],
+                cwd=str(REPO_ROOT),
+                env=runner_env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            self.assertEqual(p_run4.returncode, 0, p_run4.stderr)
+            after_tick2 = [
+                m for m in self.tg.sent_messages[before_tick2:] if m["chat_id"] == forum_chat_id
+            ]
+            self.assertEqual(after_tick2, [], f"Unchanged tick emitted duplicate alerts: {after_tick2}")
+
+            # 5. Fast SIGTERM shutdown during an active slow Stage-2 briefing (<6s, clean rc=0!)
+            slow_m = validate_mission(
+                {
+                    "id": "slow-stage2",
+                    "title": "Slow Stage2",
+                    "status": "active",
+                    "kind": "rss",
+                    "schedule": {"interval_minutes": 15},
+                    "config": {"url": f"{feed_base}/rss/0.xml"},
+                    "notify": {"priority": "normal", "quiet_hours": {"disabled": True}, "target": None},
+                }
+            )
+            atomic_write_json(mission_path(missions_dir, "slow-stage2"), missions_dir, slow_m)
+
+            from server.config import post_bridge_ipc
+
+            slow_res: list[tuple[int, dict]] = []
+
+            def _call_slow() -> None:
+                slow_res.append(
+                    post_bridge_ipc(
+                        "127.0.0.1",
+                        self.bot.ipc_port,
+                        self.root / "watcher-ipc" / "watcher.token",
+                        "/watcher",
+                        {
+                            "mission_id": "slow-stage2",
+                            "event_type": "delta",
+                            "items": [{"title": "[STAGE2_SLOW]", "url": "https://feeds.example/slow", "summary": "[STAGE2_SLOW]"}],
+                        },
+                        timeout=30.0,
+                    )
+                )
+
+            t_slow = threading.Thread(target=_call_slow, daemon=True)
+            t_slow.start()
+            time.sleep(0.5)
+            t_stop = time.time()
+            rc_stop = self.bot.stop(timeout=10.0)
+            stop_dt = time.time() - t_stop
+            t_slow.join(timeout=5.0)
+
+            self.assertEqual(rc_stop, 0, f"Expected clean rc=0 on SIGTERM during Stage-2, got {rc_stop}")
+            self.assertLess(stop_dt, 6.0, f"SIGTERM stalled during Stage-2 ({stop_dt:.2f}s)")
+            self.assertEqual(len(slow_res), 1)
+            self.assertIn(slow_res[0][0], (0, 503), f"Unexpected Stage-2 SIGTERM status: {slow_res}")
+
+            elapsed = time.time() - t0
+            print(
+                f"\n[WATCHER 25-MISSION STRESS] missions={total_missions} briefs=23 "
+                f"elapsed={elapsed:.2f}s sigterm_stop={stop_dt:.2f}s start={m_start}",
+                flush=True,
+            )
+            self.assertNotIn("SECRET_LEAK_DETECTED", self.bot.read_stderr())
+            self.assertNotIn("SCOUT_GUARD_FAILED", self.bot.read_stderr())
+            self.assertNotIn("STAGE2_LOCKOUT_FAILED", self.bot.read_stderr())
+            self.assertNotIn("Traceback (most recent call last)", self.bot.read_stderr())
+            self._check_db_integrity(self.bot.db_path)
+        finally:
+            feed_srv.shutdown()
+            feed_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

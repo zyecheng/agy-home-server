@@ -59,6 +59,7 @@ class FakeTelegram(TelegramClient):
         *,
         thread_id: int = 0,
         disable_notification: bool = False,
+        disable_web_page_preview: bool = False,
         reply_markup: dict | None = None,
         markdown: bool = False,
     ) -> dict:
@@ -70,6 +71,7 @@ class FakeTelegram(TelegramClient):
             "thread_id": thread_id,
             "text": text,
             "silent": disable_notification,
+            "disable_web_page_preview": disable_web_page_preview,
             "reply_markup": reply_markup,
             "markdown": markdown,
         }
@@ -439,7 +441,12 @@ class BridgeTestCase(unittest.TestCase):
             self.assertEqual(env.get("AGY_BRIDGE_ORIGIN"), "bridge")
 
         runner = AgyRunner(self.cfg)
-        with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["agy"], timeout=90)):
+        fake_proc = mock.MagicMock()
+        fake_proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd=["agy"], timeout=90),
+            ("", ""),
+        ]
+        with mock.patch("subprocess.Popen", return_value=fake_proc):
             res = runner.run_prompt("hello", conversation_id="conv-t")
         self.assertEqual(res.status, "TIMEOUT")
         self.assertIn("timed out", res.error)

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/agy/agy-server/server/hook_scout_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

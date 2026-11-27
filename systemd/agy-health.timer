@@ -1,0 +1,13 @@
+# Copyright (c) 2026 zyecheng
+# SPDX-License-Identifier: BSD-3-Clause
+
+[Unit]
+Description=Run Antigravity Home Server Health Probe & SQLite Backup every 15 minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=15m
+Unit=agy-health.service
+
+[Install]
+WantedBy=timers.target

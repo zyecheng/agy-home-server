@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .config import VALID_MIRROR_MODES
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -33,6 +33,7 @@ class Binding:
     active: bool
     created_at: float
     updated_at: float
+    mission_id: str | None = None
 
 
 class BridgeStore:
@@ -107,6 +108,19 @@ class BridgeStore:
                 );
                 """
             )
+            cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(bindings);").fetchall()
+            }
+            if "mission_id" not in cols:
+                self._conn.execute("ALTER TABLE bindings ADD COLUMN mission_id TEXT;")
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_mission_active
+                    ON bindings(mission_id)
+                    WHERE active = 1 AND mission_id IS NOT NULL;
+                """
+            )
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
     def close(self) -> None:
@@ -117,6 +131,7 @@ class BridgeStore:
     def _row_to_binding(row: sqlite3.Row | None) -> Binding | None:
         if row is None:
             return None
+        keys = row.keys()
         return Binding(
             id=int(row["id"]),
             channel=row["channel"],
@@ -131,6 +146,7 @@ class BridgeStore:
             active=bool(row["active"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
+            mission_id=row["mission_id"] if "mission_id" in keys else None,
         )
 
     def get_kv(self, key: str, default: str = "") -> str:
@@ -168,24 +184,39 @@ class BridgeStore:
         workspace_dir: str,
         topic_name: str = "",
         default_mirror_mode: str = "full",
+        mission_id: str | None = None,
     ) -> Binding:
         with self._lock, self._conn:
             existing = self.get_active_binding(channel, chat_id, thread_id)
             now = time.time()
+            if mission_id is not None:
+                # Avoid UNIQUE idx_bindings_mission_active conflict if a mission is rebound to a new topic
+                self._conn.execute(
+                    "UPDATE bindings SET mission_id = NULL, updated_at = ? "
+                    "WHERE mission_id = ? AND active = 1 "
+                    "AND NOT (channel = ? AND chat_id = ? AND thread_id = ?)",
+                    (now, mission_id, channel, str(chat_id), int(thread_id)),
+                )
             if existing is not None:
+                changed = False
                 if topic_name and topic_name != existing.topic_name:
-                    self._conn.execute(
-                        "UPDATE bindings SET topic_name = ?, updated_at = ? WHERE id = ?",
-                        (topic_name, now, existing.id),
-                    )
                     existing.topic_name = topic_name
+                    changed = True
+                if mission_id is not None and mission_id != existing.mission_id:
+                    existing.mission_id = mission_id
+                    changed = True
+                if changed:
+                    self._conn.execute(
+                        "UPDATE bindings SET topic_name = ?, mission_id = ?, updated_at = ? WHERE id = ?",
+                        (existing.topic_name, existing.mission_id, now, existing.id),
+                    )
                     existing.updated_at = now
                 return existing
 
             cur = self._conn.execute(
                 "INSERT INTO bindings "
-                "(channel, chat_id, thread_id, chat_type, topic_name, workspace_dir, mirror_mode, active, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                "(channel, chat_id, thread_id, chat_type, topic_name, workspace_dir, mirror_mode, active, created_at, updated_at, mission_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
                 (
                     channel,
                     str(chat_id),
@@ -196,6 +227,7 @@ class BridgeStore:
                     default_mirror_mode,
                     now,
                     now,
+                    mission_id,
                 ),
             )
             row = self._conn.execute(

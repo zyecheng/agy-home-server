@@ -13,13 +13,14 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import BridgeConfig
 
 log = logging.getLogger("agy-bridge.runner")
 
-_SENSITIVE_ENV_PREFIXES = ("TELEGRAM_", "BRIDGE_IPC_")
+_SENSITIVE_ENV_PREFIXES = ("TELEGRAM_", "BRIDGE_IPC_", "WATCHER_")
 _HEADER_SANITIZE_RE = re.compile(r"[\r\n\[\]|]+")
 
 
@@ -30,6 +31,7 @@ class AgyResult:
     response: str
     error: str = ""
     stderr: str = ""
+    structured_output: dict[str, Any] | None = None
 
 
 def _sanitize_header_val(val: str) -> str:
@@ -53,6 +55,8 @@ def format_channel_envelope(
     topic_name: str = "",
     sender: str = "",
     attachments: list[str] | None = None,
+    mission_tag: str = "",
+    initial_context: str = "",
     timezone_name: str = "America/Los_Angeles",
 ) -> str:
     """Build the compact bracketed envelope specified in Alpha's bridge_contract.md."""
@@ -65,6 +69,10 @@ def format_channel_envelope(
     parts.append(f"time: {now_str}")
     header = "[" + " | ".join(parts) + "]"
     lines = [header]
+    if mission_tag:
+        lines.append(f"[mission: {_sanitize_header_val(mission_tag)}]")
+    if initial_context:
+        lines.append(initial_context.strip())
     if attachments:
         safe_att = [_sanitize_header_val(a) for a in attachments]
         lines.append("[attachments: " + ", ".join(safe_att) + "]")
@@ -78,12 +86,13 @@ def build_scrubbed_env(
     *,
     bridge_origin: bool = True,
     binding_id: int | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build a child process environment with bridge/Telegram secrets removed."""
+    """Build a child process environment with bridge/Telegram/watcher secrets removed."""
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(_SENSITIVE_ENV_PREFIXES)
+        if not k.startswith(_SENSITIVE_ENV_PREFIXES) and k != "AGY_WATCHER_BRIEFING"
     }
     bin_path = Path(agy_bin)
     if bin_path.parent != Path("."):
@@ -100,6 +109,9 @@ def build_scrubbed_env(
     else:
         env.pop("AGY_BRIDGE_ORIGIN", None)
         env.pop("AGY_BRIDGE_BINDING_ID", None)
+    if extra_env:
+        for k, v in extra_env.items():
+            env[str(k)] = str(v)
     return env
 
 
@@ -124,9 +136,35 @@ def _parse_json_stdout(stdout: str) -> dict | None:
     return None
 
 
+@dataclass(frozen=True)
+class _CliSettings:
+    agy_bin: str
+    agy_model: str
+    alpha_workspace: Path
+    agy_timeout_seconds: int
+
+
 class AgyRunner:
-    def __init__(self, config: BridgeConfig) -> None:
+    def __init__(self, config: BridgeConfig | _CliSettings) -> None:
         self.config = config
+
+    @classmethod
+    def from_cli_settings(
+        cls,
+        *,
+        agy_bin: str,
+        agy_model: str = "",
+        alpha_workspace: Path,
+        agy_timeout_seconds: int = 150,
+    ) -> "AgyRunner":
+        return cls(
+            _CliSettings(
+                agy_bin=agy_bin,
+                agy_model=agy_model,
+                alpha_workspace=alpha_workspace,
+                agy_timeout_seconds=agy_timeout_seconds,
+            )
+        )
 
     def run_prompt(
         self,
@@ -136,9 +174,17 @@ class AgyRunner:
         workspace_dir: Path | None = None,
         timeout_seconds: int | None = None,
         binding_id: int | None = None,
+        bridge_origin: bool = True,
+        extra_env: dict[str, str] | None = None,
+        json_schema: str | None = None,
+        settings_file: Path | None = None,
+        create_workspace: bool = True,
+        on_process_start: Callable[[subprocess.Popen], None] | None = None,
+        on_process_end: Callable[[subprocess.Popen], None] | None = None,
     ) -> AgyResult:
         cwd = workspace_dir or self.config.alpha_workspace
-        cwd.mkdir(parents=True, exist_ok=True)
+        if create_workspace:
+            cwd.mkdir(parents=True, exist_ok=True)
 
         eff_timeout = (
             self.config.agy_timeout_seconds
@@ -147,8 +193,6 @@ class AgyRunner:
         )
         cmd = [
             self.config.agy_bin,
-            "-p",
-            prompt,
             "--output-format",
             "json",
             "--disable-slash-commands",
@@ -159,13 +203,19 @@ class AgyRunner:
             cmd.extend(["--model", self.config.agy_model])
         if eff_timeout > 0:
             cmd.extend(["--print-timeout", f"{eff_timeout}s"])
+        if json_schema:
+            cmd.extend(["--json-schema", json_schema])
+        if settings_file is not None:
+            cmd.extend(["--settings", str(settings_file)])
+        cmd.extend(["-p", prompt])
 
         env = build_scrubbed_env(
             self.config.agy_bin,
-            bridge_origin=True,
+            bridge_origin=bridge_origin,
             binding_id=binding_id,
+            extra_env=extra_env,
         )
-        sub_timeout = eff_timeout + 30 if eff_timeout > 0 else None
+        sub_timeout = eff_timeout + 15 if eff_timeout > 0 else None
 
         log.info(
             "Running agy -p (conv=%s, cwd=%s, len=%d, timeout=%s)",
@@ -174,31 +224,38 @@ class AgyRunner:
             len(prompt),
             sub_timeout,
         )
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if on_process_start is not None:
+            on_process_start(proc)
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(cwd),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=sub_timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stderr = (
-                exc.stderr.decode("utf-8", errors="replace").strip()
-                if isinstance(exc.stderr, bytes)
-                else str(exc.stderr or "").strip()
-            )
+            stdout_raw, stderr_raw = proc.communicate(timeout=sub_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.terminate()
+                stdout_raw, stderr_raw = proc.communicate(timeout=3)
+            except Exception:
+                proc.kill()
+                stdout_raw, stderr_raw = proc.communicate()
             return AgyResult(
                 conversation_id=conversation_id or "",
                 status="TIMEOUT",
                 response="",
                 error=f"agy timed out after {sub_timeout}s",
-                stderr=stderr,
+                stderr=(stderr_raw or "").strip(),
             )
+        finally:
+            if on_process_end is not None:
+                on_process_end(proc)
 
-        stdout = proc.stdout.strip()
-        stderr = proc.stderr.strip()
+        stdout = (stdout_raw or "").strip()
+        stderr = (stderr_raw or "").strip()
         if not stdout:
             return AgyResult(
                 conversation_id=conversation_id or "",
@@ -218,12 +275,14 @@ class AgyRunner:
                 stderr=stderr,
             )
 
+        s_out = payload.get("structured_output")
         return AgyResult(
             conversation_id=str(payload.get("conversation_id") or conversation_id or ""),
             status=str(payload.get("status") or ("SUCCESS" if proc.returncode == 0 else "ERROR")),
             response=str(payload.get("response") or "").strip(),
             error=str(payload.get("error") or (stderr if proc.returncode != 0 else "")).strip(),
             stderr=stderr,
+            structured_output=s_out if isinstance(s_out, dict) else None,
         )
 
     def run_cli_slash(
