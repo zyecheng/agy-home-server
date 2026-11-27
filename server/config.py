@@ -311,7 +311,7 @@ class BridgeConfig:
     watcher_quiet_start: str = "23:00"
     watcher_quiet_end: str = "08:00"
     max_daily_web_scouts: int = 12
-    watcher_stage2_timeout_seconds: int = 35
+    watcher_stage2_timeout_seconds: int = 90
 
     @property
     def effective_allowed_chat_ids(self) -> frozenset[int]:
@@ -436,7 +436,7 @@ class BridgeConfig:
         )
         inbox_retention_days = max(0, _parse_int(get("INBOX_RETENTION_DAYS", "7"), 7))
         stage2_timeout = max(
-            5, min(40, _parse_int(get("WATCHER_STAGE2_TIMEOUT_SECONDS", "35"), 35))
+            10, min(180, _parse_int(get("WATCHER_STAGE2_TIMEOUT_SECONDS", "90"), 90))
         )
 
         return cls(

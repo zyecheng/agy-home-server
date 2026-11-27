@@ -54,7 +54,7 @@ log = logging.getLogger("agy-bridge.watchers.runner")
 
 MAX_WEB_SCOUTS_PER_TICK = 3
 MAX_BACKOFF_SECONDS = 24 * 3600
-WATCHER_IPC_TIMEOUT_SECONDS = 60.0
+WATCHER_IPC_TIMEOUT_SECONDS = 125.0
 _SAFE_ERR_RE = re.compile(r"[^A-Za-z0-9_.:/\- ]+")
 
 

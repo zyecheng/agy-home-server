@@ -7,6 +7,8 @@ description: Scope, create, refine, and archive asynchronous proactive watch mis
 
 # Proactive Watch Missions Skill
 
+**Authoritative mission path:** Every mission spec lives at `watchers/missions/<mission_id>.json` (relative to `~/alpha-assistant/`). Do NOT look under `missions/` or run shell `ls` commands — use `view_file` / `edit_file` directly on `watchers/missions/<mission_id>.json`.
+
 Follow this 4-step workflow whenever the user asks you to monitor, scout, track, or watch something over time:
 
 ## 1. Initiate a Dedicated Mission Topic (from 1:1 DM)

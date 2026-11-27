@@ -32,6 +32,7 @@ class AgyResult:
     error: str = ""
     stderr: str = ""
     structured_output: dict[str, Any] | None = None
+    duration_seconds: float | None = None
 
 
 def _sanitize_header_val(val: str) -> str:
@@ -178,6 +179,7 @@ class AgyRunner:
         extra_env: dict[str, str] | None = None,
         json_schema: str | None = None,
         settings_file: Path | None = None,
+        effort: str = "",
         create_workspace: bool = True,
         on_process_start: Callable[[subprocess.Popen], None] | None = None,
         on_process_end: Callable[[subprocess.Popen], None] | None = None,
@@ -201,6 +203,8 @@ class AgyRunner:
             cmd.extend(["--conversation", conversation_id])
         if self.config.agy_model:
             cmd.extend(["--model", self.config.agy_model])
+        if effort:
+            cmd.extend(["--effort", effort])
         if eff_timeout > 0:
             cmd.extend(["--print-timeout", f"{eff_timeout}s"])
         if json_schema:
@@ -276,6 +280,8 @@ class AgyRunner:
             )
 
         s_out = payload.get("structured_output")
+        raw_dur = payload.get("duration_seconds")
+        dur = float(raw_dur) if isinstance(raw_dur, (int, float)) else None
         return AgyResult(
             conversation_id=str(payload.get("conversation_id") or conversation_id or ""),
             status=str(payload.get("status") or ("SUCCESS" if proc.returncode == 0 else "ERROR")),
@@ -283,6 +289,7 @@ class AgyRunner:
             error=str(payload.get("error") or (stderr if proc.returncode != 0 else "")).strip(),
             stderr=stderr,
             structured_output=s_out if isinstance(s_out, dict) else None,
+            duration_seconds=dur,
         )
 
     def run_cli_slash(
