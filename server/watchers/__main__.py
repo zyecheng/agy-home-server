@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from ..config import load_ipc_client_settings, post_bridge_ipc
+from .collectors import probe_url
 
 
 def _cmd_topic(args: argparse.Namespace) -> int:
@@ -63,9 +65,20 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--mission", default="")
     run_p.add_argument("--force", action="store_true")
 
+    probe_p = sub.add_parser(
+        "probe",
+        help="CaMeL-safe structural pre-flight probe to check Tier-A viability for a URL",
+    )
+    probe_p.add_argument("url", help="Public http(s) URL to probe")
+
     ns = parser.parse_args(argv)
     if ns.cmd == "topic":
         return _cmd_topic(ns)
+    if ns.cmd == "probe":
+        allow_loopback = os.environ.get("WATCHER_ALLOW_LOOPBACK_FOR_TESTS") == "1"
+        report = probe_url(ns.url, allow_loopback_for_tests=allow_loopback)
+        print(json.dumps(report, indent=2))
+        return 0
     if ns.cmd == "run":
         from .runner import main as runner_main
 

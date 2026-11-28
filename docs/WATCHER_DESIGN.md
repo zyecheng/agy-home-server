@@ -356,7 +356,7 @@ Verified empirically on `agy-staging` (`agy 1.5.18`): `--json-schema` enforces s
 Add `alpha-workspace/.agents/skills/watch-missions/SKILL.md`:
 1. **Initiate from DM → spawn Mission Topic:** Create a Mission Topic via `python3 -m server.watchers topic create --title "..." --request "..."` (or scope inline if `WATCHER_FORUM_CHAT_ID` is unset or already inside a Forum Topic) and share the deep link.
 2. **Clarify ambiguity inside the Mission Topic:** Ask 2–3 concise questions if criteria/cadence are vague; skip interrogation if already specific.
-3. **Choose lightest viable tier & activate:** Prefer `rss` / `github_releases` / `http_diff` over `web_scout`; write/update `watchers/missions/<id>.json` with `status: "active"` (approval-gated).
+3. **Auto-discover, probe & activate lightest viable tier:** Proactively search for an official GitHub repo, RSS/Atom feed, or direct portal URL when the user names a specific project/blog/site without pasting a URL; pre-flight check candidate URLs via `python3 -m server.watchers probe "<url>"` (SSRF-safe, returning structural metadata only — `detected_kind`, `recommended_tier`, `alternate_feeds`, `github_repo`, zero raw untrusted page prose — preserving the CaMeL boundary); prefer `github_releases` / `rss` / `http_diff` over `web_scout`, falling back to `web_scout` when `js_shell` or `blocked`; write/update `watchers/missions/<id>.json` with `status: "active"` (approval-gated).
 4. **In-thread refinement & closure:** Follow-up messages read/update `watchers/missions/<id>.json` (never reading `state/*.pending.json`!); *"done / archive"* invokes `python3 -m server.watchers topic archive --id <id>`.
 
 ### Zero-LLM Telegram Slash Commands & Context Awareness

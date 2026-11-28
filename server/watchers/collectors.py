@@ -19,22 +19,59 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from ..agy_runner import AgyRunner
 from ..transcript import is_safe_conversation_id
 from .schema import (
     DEFAULT_MAX_SEARCHES,
     EFFORT_IDLE_TIMEOUTS,
+    GITHUB_REPO_RE,
     MAX_SEARCHES_CAP,
     VALID_EFFORTS,
     is_valid_mission_id,
     slugify_title,
 )
-from .ssrf import safe_fetch
+from .ssrf import ResponseTooLargeError, SSRFError, safe_fetch, validate_url_syntax
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WS_RE = re.compile(r"\s+")
+_SAFE_MIME_RE = re.compile(r"^[a-z0-9.+_-]{1,40}/[a-z0-9.+_-]{1,60}$")
+_SAFE_PROBE_ERR_RE = re.compile(r"[^A-Za-z0-9_.:/\- ]+")
+_GITHUB_RESERVED_OWNERS = frozenset(
+    {
+        "about",
+        "account",
+        "collections",
+        "contact",
+        "customer-stories",
+        "enterprise",
+        "events",
+        "explore",
+        "features",
+        "issues",
+        "join",
+        "login",
+        "logout",
+        "marketplace",
+        "new",
+        "notifications",
+        "orgs",
+        "pricing",
+        "pulls",
+        "readme",
+        "search",
+        "security",
+        "sessions",
+        "settings",
+        "signup",
+        "sponsors",
+        "team",
+        "topics",
+        "trending",
+        "users",
+    }
+)
 
 SCOUT_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -634,3 +671,319 @@ def collect_web_scout(
         new_seen_ids=new_seen,
         new_entities=new_entities,
     )
+
+
+def _extract_github_repo(url: str) -> str | None:
+    """Extract canonical 'owner/repo' from a public github.com repository/releases URL."""
+    try:
+        parsed = urlparse((url or "").strip())
+    except Exception:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host not in ("github.com", "www.github.com"):
+        return None
+    segs = [s for s in parsed.path.split("/") if s]
+    if len(segs) < 2:
+        return None
+    owner, repo = segs[0], segs[1]
+    if owner.lower() in _GITHUB_RESERVED_OWNERS:
+        return None
+    if repo.endswith(".git") and len(repo) > 4:
+        repo = repo[:-4]
+    cand = f"{owner}/{repo}"
+    return cand if GITHUB_REPO_RE.match(cand) else None
+
+
+class _HtmlProbeParser(HTMLParser):
+    """Extract ONLY structural feed links and SPA/JS-shell indicators (zero raw page prose)."""
+
+    _FEED_MIME_TYPES = frozenset(
+        {
+            "application/rss+xml",
+            "application/atom+xml",
+            "application/rdf+xml",
+            "application/xml",
+            "text/xml",
+        }
+    )
+    _SPA_ROOT_IDS = frozenset({"root", "app", "__next", "__nuxt", "svelte", "app-root"})
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._base_url = base_url
+        self.alternate_feeds: list[str] = []
+        self._seen_feeds: set[str] = set()
+        self.script_count = 0
+        self.has_spa_root = False
+        self.has_js_noscript = False
+        self._in_noscript = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        attr_map = {k.lower(): (v or "") for k, v in attrs}
+        if t == "script":
+            self.script_count += 1
+        elif t == "noscript":
+            self._in_noscript += 1
+        elif t == "div":
+            div_id = attr_map.get("id", "").strip().lower()
+            if div_id in self._SPA_ROOT_IDS or "data-reactroot" in attr_map:
+                self.has_spa_root = True
+        elif t == "link":
+            rel_tokens = {tok.lower() for tok in attr_map.get("rel", "").split()}
+            ctype = attr_map.get("type", "").split(";", 1)[0].strip().lower()
+            href = attr_map.get("href", "").strip()
+            if "alternate" in rel_tokens and ctype in self._FEED_MIME_TYPES and href:
+                if len(self.alternate_feeds) >= 3:
+                    return
+                resolved = urljoin(self._base_url, href)
+                safe = _safe_http_url(resolved)
+                if not safe or safe in self._seen_feeds:
+                    return
+                try:
+                    validate_url_syntax(safe)
+                except SSRFError:
+                    return
+                self._seen_feeds.add(safe)
+                self.alternate_feeds.append(safe)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "noscript" and self._in_noscript > 0:
+            self._in_noscript -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._in_noscript > 0:
+            low = data.lower()
+            if "javascript" in low or "enable js" in low:
+                self.has_js_noscript = True
+
+
+def _sanitize_mime(raw: str) -> str:
+    base = (raw or "").split(";", 1)[0].strip().lower()
+    return base if _SAFE_MIME_RE.match(base) else "unknown"
+
+
+def _probe_xml_feed_count(body: bytes) -> int | None:
+    """Return RSS/Atom entry count if body is a safe XML feed, else None."""
+
+    def _reject_dtd(*_args: Any) -> None:
+        raise ValueError("unsafe_doctype")
+
+    expat_check = pyexpat.ParserCreate()
+    expat_check.StartDoctypeDeclHandler = _reject_dtd
+    expat_check.EntityDeclHandler = _reject_dtd
+    expat_check.UnparsedEntityDeclHandler = _reject_dtd
+    try:
+        expat_check.Parse(body, True)
+        root = ET.fromstring(body)
+    except Exception:
+        return None
+
+    root_name = _strip_xml_ns(root.tag)
+    if root_name == "feed":
+        return sum(1 for c in root if _strip_xml_ns(c.tag) == "entry")
+    if root_name == "rss":
+        channel = next((c for c in root if _strip_xml_ns(c.tag) == "channel"), root)
+        return sum(1 for c in channel if _strip_xml_ns(c.tag) == "item")
+    if root_name == "rdf":
+        return sum(1 for c in root if _strip_xml_ns(c.tag) == "item")
+    return None
+
+
+def probe_url(
+    url: str,
+    *,
+    allow_loopback_for_tests: bool = False,
+) -> dict[str, Any]:
+    """CaMeL-safe structural pre-flight probe for Tier-A collector discovery.
+
+    Uses IP-pinned SSRF-safe fetching and returns ONLY deterministic enums, counts,
+    booleans, and syntax-validated http(s) URLs — never raw untrusted page prose.
+    """
+    clean_input = _safe_http_url(url)
+    base_result: dict[str, Any] = {
+        "ok": False,
+        "final_url": clean_input,
+        "http_status": 0,
+        "content_type": "unknown",
+        "detected_kind": "invalid_url",
+        "recommended_tier": "web_scout",
+        "has_etag": False,
+        "has_last_modified": False,
+        "text_chars": 0,
+        "feed_item_count": 0,
+        "alternate_feeds": [],
+        "github_repo": None,
+        "reason": "invalid_url",
+    }
+    if not clean_input:
+        return base_result
+
+    try:
+        resp = safe_fetch(
+            clean_input,
+            headers={
+                "Accept": (
+                    "application/rss+xml, application/atom+xml, application/xml, "
+                    "application/json, text/html, text/plain;q=0.8"
+                )
+            },
+            allow_loopback_for_tests=allow_loopback_for_tests,
+        )
+    except SSRFError:
+        return {
+            **base_result,
+            "detected_kind": "ssrf_blocked",
+            "reason": "ssrf_blocked",
+        }
+    except ResponseTooLargeError:
+        return {
+            **base_result,
+            "detected_kind": "too_large",
+            "reason": "response_too_large",
+        }
+    except Exception as exc:
+        err_code = _SAFE_PROBE_ERR_RE.sub(" ", type(exc).__name__).strip()[:64] or "fetch_error"
+        return {
+            **base_result,
+            "detected_kind": "unreachable",
+            "reason": f"unreachable:{err_code}",
+        }
+
+    final_url = _safe_http_url(resp.url) or clean_input
+    ctype = _sanitize_mime(resp.headers.get("content-type", ""))
+    has_etag = bool(resp.headers.get("etag"))
+    has_last_mod = bool(resp.headers.get("last-modified"))
+    gh_repo = _extract_github_repo(final_url) or _extract_github_repo(clean_input)
+
+    out: dict[str, Any] = {
+        "ok": False,
+        "final_url": final_url,
+        "http_status": int(resp.status),
+        "content_type": ctype,
+        "detected_kind": "unknown",
+        "recommended_tier": "web_scout",
+        "has_etag": has_etag,
+        "has_last_modified": has_last_mod,
+        "text_chars": 0,
+        "feed_item_count": 0,
+        "alternate_feeds": [],
+        "github_repo": gh_repo,
+        "reason": "",
+    }
+
+    if resp.status in (401, 403, 429, 503) or resp.headers.get("cf-mitigated"):
+        out["detected_kind"] = "blocked"
+        out["recommended_tier"] = "web_scout"
+        out["reason"] = f"http_blocked_{resp.status}"
+        return out
+
+    if resp.status < 200 or resp.status >= 300:
+        out["detected_kind"] = "http_error"
+        out["recommended_tier"] = "web_scout"
+        out["reason"] = f"http_status_{resp.status}"
+        return out
+
+    decoded = resp.body.decode("utf-8", errors="replace")
+    head = decoded.lstrip()[:64].lower()
+
+    # 1. GitHub repository URL -> prefer github_releases API directly
+    if gh_repo:
+        out["ok"] = True
+        out["detected_kind"] = "github_repo"
+        out["recommended_tier"] = "github_releases"
+        out["reason"] = "github_repository_detected"
+        return out
+
+    # 2. RSS / Atom XML feed
+    if (
+        any(tok in ctype for tok in ("rss", "atom", "xml"))
+        or head.startswith(("<?xml", "<rss", "<feed", "<rdf:rdf"))
+    ):
+        feed_count = _probe_xml_feed_count(resp.body)
+        if feed_count is not None:
+            out["ok"] = True
+            out["detected_kind"] = "rss"
+            out["recommended_tier"] = "rss"
+            out["feed_item_count"] = feed_count
+            out["reason"] = "valid_rss_or_atom_feed"
+            return out
+
+    # 3. JSON endpoint
+    if ctype == "application/json" or ctype.endswith("+json") or head.startswith(("{", "[")):
+        try:
+            json.loads(decoded)
+            out["ok"] = True
+            out["detected_kind"] = "json"
+            out["recommended_tier"] = "http_diff"
+            out["text_chars"] = len(decoded.strip())
+            out["reason"] = "valid_json_endpoint"
+            return out
+        except json.JSONDecodeError:
+            pass
+
+    # 4. HTML / plain text inspection (zero raw text echoed)
+    normalized = normalize_html_text(decoded)
+    text_chars = len(normalized)
+    out["text_chars"] = text_chars
+    low_norm = normalized.lower()
+
+    is_html = "html" in ctype or ("<" in decoded[:512] and ">" in decoded[:512])
+    alt_feeds: list[str] = []
+    script_count = 0
+    has_spa_root = False
+    has_js_noscript = False
+    if is_html:
+        parser = _HtmlProbeParser(final_url)
+        try:
+            parser.feed(decoded)
+            parser.close()
+            alt_feeds = parser.alternate_feeds
+            script_count = parser.script_count
+            has_spa_root = parser.has_spa_root
+            has_js_noscript = parser.has_js_noscript
+        except Exception:
+            pass
+    out["alternate_feeds"] = alt_feeds
+
+    if text_chars < 400 and any(
+        marker in low_norm
+        for marker in (
+            "just a moment",
+            "attention required",
+            "checking your browser",
+            "enable javascript and cookies",
+            "access denied",
+        )
+    ):
+        out["detected_kind"] = "blocked"
+        out["recommended_tier"] = "web_scout"
+        out["reason"] = "bot_challenge_page"
+        return out
+
+    if is_html and text_chars < 200 and (script_count >= 2 or has_spa_root or has_js_noscript):
+        out["detected_kind"] = "js_shell"
+        if alt_feeds:
+            out["ok"] = True
+            out["recommended_tier"] = "rss"
+            out["reason"] = "js_shell_with_alternate_feed"
+        else:
+            out["recommended_tier"] = "web_scout"
+            out["reason"] = "js_rendered_spa_shell"
+        return out
+
+    if text_chars < 20:
+        out["detected_kind"] = "empty"
+        out["recommended_tier"] = "web_scout"
+        out["reason"] = "empty_response_text"
+        return out
+
+    out["ok"] = True
+    out["detected_kind"] = "html_static" if is_html else "text_plain"
+    if alt_feeds:
+        out["recommended_tier"] = "rss"
+        out["reason"] = "static_html_with_alternate_feed"
+    else:
+        out["recommended_tier"] = "http_diff"
+        out["reason"] = "static_content_viable"
+    return out
