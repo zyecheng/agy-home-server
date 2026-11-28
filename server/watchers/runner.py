@@ -347,9 +347,16 @@ class WatcherRunner:
             list(state.get("seen_ids") or []),
             list(pending.get("new_seen_ids") or []),
         )
+        tagged_entities: list[dict[str, Any]] = []
+        for ent in list(pending.get("new_entities") or []):
+            if isinstance(ent, dict):
+                rec = dict(ent)
+                if status in ("delivered", "suppressed"):
+                    rec["outcome"] = status
+                tagged_entities.append(rec)
         state["known_entities"] = _append_entities(
             list(state.get("known_entities") or []),
-            list(pending.get("new_entities") or []),
+            tagged_entities,
         )
         state["pending_count"] = 0
         state["next_flush_at"] = 0.0

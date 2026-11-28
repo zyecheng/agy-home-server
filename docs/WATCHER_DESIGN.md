@@ -224,14 +224,14 @@ Managed exclusively by `watcher_runner.py` under per-mission `flock` (`watchers/
      "last_hash": "sha256:...",
      "seen_ids": ["sha256:..."],
      "known_entities": [
-       {"key": "csma-arts4all", "url_hash": "sha256:...", "first_seen": "2026-11-26"}
+       {"key": "csma-arts4all", "url_hash": "sha256:...", "first_seen": "2026-11-26", "outcome": "delivered"}
      ],
      "pending_count": 0
    }
    ```
    - `last_error` stores only a bounded, sanitized error category/code (`<= 120` chars, never raw HTTP response bodies).
    - `last_checkin_at` initializes from mission `created_at` (or first run timestamp), never `0`.
-   - `seen_ids` capped at 500 entries (FIFO ring), `known_entities` capped at 100 entries (strict slug `key` regex `^[a-z0-9][a-z0-9_-]{0,63}$`).
+   - `seen_ids` capped at 500 entries (FIFO ring), `known_entities` capped at 100 entries (strict slug `key` regex `^[a-z0-9][a-z0-9_-]{0,63}$`, strict `YYYY-MM-DD` `first_seen`, and strict `outcome` enum `"delivered"` | `"suppressed"`). All up to 100 validated entries are injected into **both** Stage-1 `web_scout` and Stage-2 judge prompts so cross-URL/alias duplicates are caught without ever persisting untrusted web prose.
 2. **Untrusted pending delivery queue (`watchers/state/<id>.pending.json` — touched ONLY by `watcher_runner.py`, NEVER read by interactive Alpha or `/watch status`):**
    - Stores at most 50 queued Stage-1 items awaiting morning quiet-hours flush or retry after a failed `POST /watcher` attempt.
 3. **Global runner metadata (`watchers/state/_runner_meta.json`, short-lived `_runner_meta.lock`):**
@@ -276,7 +276,7 @@ Verified empirically on `agy-staging` (`agy 1.5.18`): `--json-schema` enforces s
    - **Consecutive-failure escalation:** After `consecutive_failures >= 2`, `watcher_runner.py` posts a single silent (`disable_notification=True`) warning into the Mission Topic (`event_type: "failure_alert"`), followed by a silent recovery note (`event_type: "failure_recovered"`) once healthy again.
    - `--settings ~/agy-scout-sandbox/.agents/settings.json` pinning strict review policy.
    - `--json-schema <scout_output_schema.json>` requiring `items` (max 10 objects: `key`, `title`, `url`, `summary`, `confidence`) and `notes`.
-   - Prompt includes mission `queries`, `relevance_criteria`, `exclusions`, and (wrapped inside a random-nonce `<known_keys_HEX>` block) ONLY previously validated slug keys (`^[a-z0-9][a-z0-9_-]{0,63}$`, max 30 keys — zero free-form attacker prose).
+   - Prompt includes mission `queries`, `relevance_criteria`, `exclusions`, and (wrapped inside a random-nonce `<known_entities_HEX>` block) ALL up to 100 previously validated slug keys + strict `YYYY-MM-DD` date/`delivered`|`suppressed` outcome enums (zero free-form attacker prose), instructing the scout not to pad results from evergreen directories when nothing genuinely new exists.
 2. **Quarantined `.agents/hooks.json`** (`~/agy-scout-sandbox/.agents/hooks.json`):
    - `PreToolUse` (`matcher: ".*"`) calls `server/hook_scout_guard.py`:
      - Returns `{"decision": "auto_approve"}` **ONLY** when `toolCall.name in ("search_web", "finish")` (and `search_web` query is a string `<= 300` chars).

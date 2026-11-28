@@ -20,12 +20,14 @@ from .ssrf import validate_url_syntax
 MISSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SAFE_ERR_RE = re.compile(r"[^A-Za-z0-9_.:/\- ]+")
 
 VALID_STATUSES = ("scoping", "active", "paused", "archived")
 VALID_KINDS = ("rss", "github_releases", "http_diff", "web_scout")
 VALID_PRIORITIES = ("normal", "urgent")
 VALID_EFFORTS = ("low", "medium", "high")
+VALID_ENTITY_OUTCOMES = ("delivered", "suppressed")
 EFFORT_IDLE_TIMEOUTS: dict[str, int] = {"low": 120, "medium": 180, "high": 240}
 DEFAULT_MAX_SEARCHES = 5
 MAX_SEARCHES_CAP = 15
@@ -535,13 +537,18 @@ def load_safe_state(state_dir: Path, mission: dict[str, Any]) -> dict[str, Any]:
             k = str(ent.get("key") or "").strip()
             if not is_valid_mission_id(k):
                 continue
-            clean_ents.append(
-                {
-                    "key": k,
-                    "url_hash": str(ent.get("url_hash") or "")[:128],
-                    "first_seen": str(ent.get("first_seen") or "")[:32],
-                }
-            )
+            raw_date = str(ent.get("first_seen") or "").strip()[:10]
+            first_seen = raw_date if ISO_DATE_RE.match(raw_date) else ""
+            raw_out = str(ent.get("outcome") or "").strip().lower()
+            outcome = raw_out if raw_out in VALID_ENTITY_OUTCOMES else ""
+            rec: dict[str, str] = {
+                "key": k,
+                "url_hash": str(ent.get("url_hash") or "")[:128],
+                "first_seen": first_seen,
+            }
+            if outcome:
+                rec["outcome"] = outcome
+            clean_ents.append(rec)
         merged["known_entities"] = clean_ents[-MAX_KNOWN_ENTITIES:]
 
     return merged
