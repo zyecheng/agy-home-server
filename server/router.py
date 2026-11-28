@@ -1138,12 +1138,21 @@ class BridgeRouter:
             f"Mission: {mission['title']} ({mission['id']})",
             f"Status: {mission['status']} | Kind: {mission['kind']} | Cadence: every {iv}m",
             f"Priority: {notify.get('priority', 'normal')} | Quiet hours: {qh_str}",
-            f"Last run: {_format_ts(float(st.get('last_run_at') or 0), self.config.timezone_name)}",
-            f"Next run: {_format_ts(float(st.get('next_run_at') or 0), self.config.timezone_name) if mission['status'] == 'active' else '-'}",
-            f"Last notified: {_format_ts(float(st.get('last_notified_at') or 0), self.config.timezone_name)}",
-            f"Tracked entities: {len(st.get('known_entities') or [])} | Seen IDs: {len(st.get('seen_ids') or [])} | Pending: {int(st.get('pending_count') or 0)}",
-            f"Failures: {int(st.get('consecutive_failures') or 0)} | Last error: {st.get('last_error') or 'none'}",
         ]
+        if mission["kind"] == "web_scout":
+            cfg = mission.get("config") or {}
+            lines.append(
+                f"Scout profile: effort={cfg.get('effort') or 'low'} | max_searches={cfg.get('max_searches') or 5}"
+            )
+        lines.extend(
+            [
+                f"Last run: {_format_ts(float(st.get('last_run_at') or 0), self.config.timezone_name)}",
+                f"Next run: {_format_ts(float(st.get('next_run_at') or 0), self.config.timezone_name) if mission['status'] == 'active' else '-'}",
+                f"Last notified: {_format_ts(float(st.get('last_notified_at') or 0), self.config.timezone_name)}",
+                f"Tracked entities: {len(st.get('known_entities') or [])} | Seen IDs: {len(st.get('seen_ids') or [])} | Pending: {int(st.get('pending_count') or 0)}",
+                f"Failures: {int(st.get('consecutive_failures') or 0)} | Last error: {st.get('last_error') or 'none'}",
+            ]
+        )
         if mission.get("relevance_criteria"):
             lines.append(f"Criteria: {mission['relevance_criteria'][:300]}")
         if mission.get("exclusions"):
@@ -1785,7 +1794,7 @@ class BridgeRouter:
             return {"status": "error", "error": f"mission_not_active:{mission['status']}"}
 
         event_type = str(payload.get("event_type") or "delta").strip().lower()
-        if event_type not in ("delta", "checkin", "expired"):
+        if event_type not in ("delta", "checkin", "expired", "failure_alert", "failure_recovered"):
             return {"status": "error", "error": f"invalid_event_type:{event_type}"}
 
         chat_id, thread_id, binding, target_err = self._resolve_mission_delivery_target(mission)
@@ -1824,6 +1833,51 @@ class BridgeRouter:
                     f"[Watch Check-in] Still want me monitoring '{mission['title']}' (`{mid}`)?\n"
                     "Reply here to tweak criteria, or run `/watch archive` to wrap it up."
                 ),
+                markdown=False,
+                disable_notification=True,
+            )
+            if not ok:
+                return {"status": "failed", "detail": err}
+            return {"status": "delivered"}
+
+        if event_type == "failure_alert":
+            try:
+                failures = int(payload.get("consecutive_failures") or 0)
+                backoff_min = max(1, min(1440, int(payload.get("backoff_minutes") or 60)))
+            except (TypeError, ValueError):
+                return {"status": "error", "error": "invalid_failure_counts"}
+            if failures < 2:
+                return {"status": "error", "error": "failure_threshold_not_met"}
+            safe_err = re.sub(
+                r"[^A-Za-z0-9_.:/\- ]+", " ", str(payload.get("error_code") or "collector_error")
+            ).strip()[:120] or "collector_error"
+            backoff_str = (
+                f"{backoff_min // 60}h"
+                if backoff_min >= 60 and backoff_min % 60 == 0
+                else (f"{backoff_min / 60:.1f}h" if backoff_min >= 60 else f"{backoff_min}m")
+            )
+            ok, err = self._deliver_watcher_telegram(
+                mission=mission,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                text=(
+                    f"[Watch Warning] Mission '{mission['title']}' ({mid}) failed {failures} times in a row "
+                    f"({safe_err}). Next retry backed off to {backoff_str}.\n"
+                    "Reply here to adjust queries/effort or run /watch status."
+                ),
+                markdown=False,
+                disable_notification=True,
+            )
+            if not ok:
+                return {"status": "failed", "detail": err}
+            return {"status": "delivered"}
+
+        if event_type == "failure_recovered":
+            ok, err = self._deliver_watcher_telegram(
+                mission=mission,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                text=f"[Watch Recovered] Mission '{mission['title']}' ({mid}) is running normally again.",
                 markdown=False,
                 disable_notification=True,
             )

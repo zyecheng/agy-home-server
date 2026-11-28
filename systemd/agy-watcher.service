@@ -13,7 +13,7 @@ WorkingDirectory=/home/agy/agy-server
 Environment="PATH=/home/agy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="BRIDGE_ENV_FILE=/home/agy/agy-server/watcher-ipc/watcher.env"
 ExecStart=/usr/bin/python3 -m server.watchers.runner
-TimeoutStartSec=720
+TimeoutStartSec=1200
 StandardOutput=journal
 StandardError=journal
 

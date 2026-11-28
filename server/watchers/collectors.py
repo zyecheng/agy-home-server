@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 import xml.parsers.expat as pyexpat
 from dataclasses import dataclass, field
@@ -21,7 +23,14 @@ from urllib.parse import urlparse
 
 from ..agy_runner import AgyRunner
 from ..transcript import is_safe_conversation_id
-from .schema import is_valid_mission_id, slugify_title
+from .schema import (
+    DEFAULT_MAX_SEARCHES,
+    EFFORT_IDLE_TIMEOUTS,
+    MAX_SEARCHES_CAP,
+    VALID_EFFORTS,
+    is_valid_mission_id,
+    slugify_title,
+)
 from .ssrf import safe_fetch
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -457,12 +466,22 @@ def collect_web_scout(
     agy_runner: AgyRunner,
     scout_sandbox_dir: Path,
     brain_dir: Path,
-    timeout_seconds: int = 180,
+    hard_timeout_seconds: int = 900,
+    idle_timeout_seconds: float | None = None,
 ) -> CollectResult:
-    """Run Stage-1B quarantined open-web scout via agy -p --json-schema."""
+    """Run Stage-1B quarantined open-web scout via stream-json idle timeout + max_searches budget."""
     cfg = mission.get("config") or {}
     queries = [str(q).strip() for q in (cfg.get("queries") or []) if str(q).strip()][:4]
     max_items = max(1, min(10, int(cfg.get("max_items") or 8)))
+    effort = str(cfg.get("effort") or "low").strip().lower()
+    if effort not in VALID_EFFORTS:
+        effort = "low"
+    max_searches = max(1, min(MAX_SEARCHES_CAP, int(cfg.get("max_searches") or DEFAULT_MAX_SEARCHES)))
+    eff_idle = (
+        float(idle_timeout_seconds)
+        if idle_timeout_seconds is not None
+        else float(EFFORT_IDLE_TIMEOUTS[effort])
+    )
     criteria = _clean_text(str(mission.get("relevance_criteria") or ""), 600)
     exclusions = [_clean_text(str(e), 160) for e in (mission.get("exclusions") or [])][:15]
 
@@ -485,7 +504,7 @@ def collect_web_scout(
 
     nonce = secrets.token_hex(6)
     prompt_lines = [
-        "You are a quarantined open-web scout. Use ONLY `search_web` (at most 3 calls total — one per query) to find fresh public listings/updates matching this mission, then immediately call `finish` with strict JSON.",
+        f"You are a quarantined open-web scout. Use ONLY `search_web` (hard budget: at most {max_searches} calls total) to find fresh public listings/updates matching this mission, then immediately call `finish` with strict JSON.",
         f"Mission: {_clean_text(str(mission.get('title') or ''), 128)}",
         f"Queries to run: {json.dumps(queries, ensure_ascii=False)}",
         f"Relevance criteria: {criteria or '(general match)'}",
@@ -511,16 +530,39 @@ def collect_web_scout(
     ):
         raise RuntimeError("scout_sandbox_guard_missing")
 
-    result = agy_runner.run_prompt(
-        "\n".join(prompt_lines),
-        workspace_dir=scout_sandbox_dir,
-        timeout_seconds=timeout_seconds,
-        bridge_origin=False,
-        json_schema=json.dumps(SCOUT_OUTPUT_SCHEMA, separators=(",", ":")),
-        settings_file=settings_file,
-        effort="low",
-        create_workspace=False,
+    # Create private per-run search counter in PrivateTmp for deterministic hook_scout_guard budget
+    counter_path = Path(tempfile.gettempdir()) / f"scout-budget-{secrets.token_hex(8)}.txt"
+    fd = os.open(
+        str(counter_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
     )
+    try:
+        os.write(fd, b"0\n")
+    finally:
+        os.close(fd)
+
+    try:
+        result = agy_runner.run_prompt(
+            "\n".join(prompt_lines),
+            workspace_dir=scout_sandbox_dir,
+            timeout_seconds=hard_timeout_seconds,
+            idle_timeout_seconds=eff_idle,
+            bridge_origin=False,
+            extra_env={
+                "AGY_SCOUT_MAX_SEARCHES": str(max_searches),
+                "AGY_SCOUT_COUNTER_FILE": str(counter_path),
+            },
+            json_schema=json.dumps(SCOUT_OUTPUT_SCHEMA, separators=(",", ":")),
+            settings_file=settings_file,
+            effort=effort,
+            create_workspace=False,
+        )
+    finally:
+        try:
+            counter_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     if result.conversation_id:
         prune_ephemeral_brain_dir(brain_dir, result.conversation_id)
 

@@ -55,6 +55,7 @@ log = logging.getLogger("agy-bridge.watchers.runner")
 MAX_WEB_SCOUTS_PER_TICK = 3
 MAX_BACKOFF_SECONDS = 24 * 3600
 WATCHER_IPC_TIMEOUT_SECONDS = 125.0
+FAILURE_ALERT_THRESHOLD = 2
 _SAFE_ERR_RE = re.compile(r"[^A-Za-z0-9_.:/\- ]+")
 
 
@@ -276,6 +277,40 @@ class WatcherRunner:
             timeout=WATCHER_IPC_TIMEOUT_SECONDS,
         )
 
+    def _maybe_notify_failure(
+        self,
+        mission_id: str,
+        state: dict[str, Any],
+        *,
+        backoff_seconds: float,
+    ) -> None:
+        failures = int(state.get("consecutive_failures") or 0)
+        if failures < FAILURE_ALERT_THRESHOLD or state.get("failure_alerted"):
+            return
+        code, body = self._post_watcher(
+            {
+                "mission_id": mission_id,
+                "event_type": "failure_alert",
+                "consecutive_failures": failures,
+                "error_code": str(state.get("last_error") or "collector_error")[:120],
+                "backoff_minutes": max(1, int(round(backoff_seconds / 60.0))),
+            }
+        )
+        if code == 200 and body.get("status") == "delivered":
+            state["failure_alerted"] = True
+
+    def _maybe_notify_recovery(self, mission_id: str, state: dict[str, Any]) -> None:
+        if not state.get("failure_alerted"):
+            return
+        code, body = self._post_watcher(
+            {
+                "mission_id": mission_id,
+                "event_type": "failure_recovered",
+            }
+        )
+        if code == 200 and body.get("status") == "delivered":
+            state["failure_alerted"] = False
+
     def _commit_delivered(
         self,
         mission_id: str,
@@ -299,6 +334,7 @@ class WatcherRunner:
         state["last_error"] = ""
         if status == "delivered":
             state["last_notified_at"] = now_ts
+        self._maybe_notify_recovery(mission_id, state)
         # Persist state.json BEFORE unlinking pending.json so a crash never loses committed IDs
         atomic_write_json(state_path(self.config.state_dir, mission_id), self.config.state_dir, state)
         self._save_pending(mission_id, {"items": [], "new_seen_ids": [], "new_entities": []})
@@ -495,7 +531,9 @@ class WatcherRunner:
                 state["last_run_at"] = now
                 state["consecutive_failures"] = failures
                 state["last_error"] = _sanitize_error_code(exc)
-                state["next_run_at"] = self._compute_next_run(mission, now_ts=now, failures=failures)
+                next_ts = self._compute_next_run(mission, now_ts=now, failures=failures)
+                state["next_run_at"] = next_ts
+                self._maybe_notify_failure(mid, state, backoff_seconds=max(60.0, next_ts - now))
                 atomic_write_json(sfile, self.config.state_dir, state)
                 return {"mission_id": mid, "outcome": "collector_failed", "detail": state["last_error"]}
 
@@ -542,6 +580,7 @@ class WatcherRunner:
                 )
             state["consecutive_failures"] = 0
             state["last_error"] = ""
+            self._maybe_notify_recovery(mid, state)
 
             # 4. 30-day check-in (when silent for checkin_after_days and outside quiet hours)
             checkin_days = int((mission.get("lifecycle") or {}).get("checkin_after_days") or 0)

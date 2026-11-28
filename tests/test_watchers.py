@@ -277,6 +277,50 @@ class SchemaAndContainmentTests(unittest.TestCase):
                     }
                 )
 
+            # web_scout effort & max_searches validation + failure_alerted state check
+            m_ws = validate_mission(
+                {
+                    "id": "deep-scout",
+                    "title": "Deep Scout",
+                    "status": "active",
+                    "kind": "web_scout",
+                    "schedule": {"interval_minutes": 60},
+                    "config": {"queries": ["piano mv"], "effort": "HIGH", "max_searches": 8},
+                }
+            )
+            self.assertEqual(m_ws["config"]["effort"], "high")
+            self.assertEqual(m_ws["config"]["max_searches"], 8)
+            for bad_cfg in (
+                {"queries": ["piano"], "effort": "ultra"},
+                {"queries": ["piano"], "max_searches": 0},
+                {"queries": ["piano"], "max_searches": 99},
+                {"queries": ["piano"], "max_searches": True},
+            ):
+                with self.assertRaises(MissionValidationError, msg=f"Should reject {bad_cfg}"):
+                    validate_mission(
+                        {
+                            "id": "bad-scout",
+                            "title": "Bad",
+                            "status": "active",
+                            "kind": "web_scout",
+                            "schedule": {"interval_minutes": 60},
+                            "config": bad_cfg,
+                        }
+                    )
+
+            atomic_write_json(
+                state_path(state_dir, "safe-st"),
+                state_dir,
+                {"failure_alerted": "yes"},
+            )
+            self.assertFalse(load_safe_state(state_dir, m)["failure_alerted"])
+            atomic_write_json(
+                state_path(state_dir, "safe-st"),
+                state_dir,
+                {"failure_alerted": True},
+            )
+            self.assertTrue(load_safe_state(state_dir, m)["failure_alerted"])
+
 
 class CaMeLHookLockoutTests(unittest.TestCase):
     def test_hook_scout_guard_allows_only_search_web_and_finish(self) -> None:
@@ -306,6 +350,109 @@ class CaMeLHookLockoutTests(unittest.TestCase):
             {"toolCall": {"name": "search_web", "args": {"query": "x" * 350}}}
         )
         self.assertEqual(dec, "deny")
+
+    def test_hook_scout_guard_enforces_max_searches_budget_and_allows_finish(self) -> None:
+        fd, raw_path = tempfile.mkstemp(prefix="test-scout-budget-", suffix=".cnt")
+        os.close(fd)
+        counter = Path(raw_path)
+        try:
+            call = {"toolCall": {"name": "search_web", "args": {"query": "piano lessons mv"}}}
+            d1, _ = evaluate_tool_call(call, max_searches=2, counter_file=counter)
+            d2, _ = evaluate_tool_call(call, max_searches=2, counter_file=counter)
+            d3, reason3 = evaluate_tool_call(call, max_searches=2, counter_file=counter)
+            d_fin, _ = evaluate_tool_call(
+                {"toolCall": {"name": "finish", "args": {"items": []}}},
+                max_searches=2,
+                counter_file=counter,
+            )
+            self.assertEqual(d1, "auto_approve")
+            self.assertEqual(d2, "auto_approve")
+            self.assertEqual(d3, "deny")
+            self.assertIn("Search budget (2 search_web calls) reached", reason3)
+            self.assertIn("finish", reason3)
+            self.assertEqual(d_fin, "auto_approve")
+        finally:
+            counter.unlink(missing_ok=True)
+
+    def test_stream_json_idle_timeout_resets_on_progress_and_kills_wedged_proc(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            runner = AgyRunner.from_cli_settings(agy_bin="agy", alpha_workspace=Path(td))
+
+            # 1. Active stream emitting step_update every 0.15s for 0.6s with 0.35s idle timeout MUST succeed!
+            active_code = (
+                "import json, sys, time\n"
+                "print(json.dumps({'event':'init','conversation_id':'conv-stream-1'}), flush=True)\n"
+                "for i in range(4):\n"
+                "    time.sleep(0.15)\n"
+                "    print(json.dumps({'event':'step_update','step':{'id':str(i),'state':'DONE'}}), flush=True)\n"
+                "print(json.dumps({'event':'result','result':{'conversation_id':'conv-stream-1','status':'SUCCESS',"
+                "'response':'ok','structured_output':{'items':[{'title':'Found'}]},'duration_seconds':0.6}}), flush=True)\n"
+            )
+            proc_ok = subprocess.Popen(
+                [sys.executable, "-u", "-c", active_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+            res_ok = runner._run_stream_json(
+                proc_ok,
+                conversation_id=None,
+                idle_timeout_seconds=0.45,
+                hard_timeout_seconds=5.0,
+            )
+            self.assertEqual(res_ok.status, "SUCCESS", res_ok.error)
+            self.assertEqual(res_ok.conversation_id, "conv-stream-1")
+            self.assertEqual(res_ok.structured_output, {"items": [{"title": "Found"}]})
+
+            # 2. Wedged stream emitting init then hanging MUST time out with idle timeout!
+            wedged_code = (
+                "import json, time\n"
+                "print(json.dumps({'event':'init','conversation_id':'conv-stuck'}), flush=True)\n"
+                "time.sleep(5.0)\n"
+            )
+            proc_stuck = subprocess.Popen(
+                [sys.executable, "-u", "-c", wedged_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+            res_stuck = runner._run_stream_json(
+                proc_stuck,
+                conversation_id=None,
+                idle_timeout_seconds=0.3,
+                hard_timeout_seconds=5.0,
+            )
+            self.assertEqual(res_stuck.status, "TIMEOUT")
+            self.assertEqual(res_stuck.conversation_id, "conv-stuck")
+            self.assertIn("idle timeout", res_stuck.error)
+
+            # 3. Chatty stream exceeding hard ceiling MUST hit hard ceiling even while emitting events!
+            chatty_code = (
+                "import json, time\n"
+                "for i in range(40):\n"
+                "    print(json.dumps({'event':'step_update','i':i}), flush=True)\n"
+                "    time.sleep(0.05)\n"
+            )
+            proc_hard = subprocess.Popen(
+                [sys.executable, "-u", "-c", chatty_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+            res_hard = runner._run_stream_json(
+                proc_hard,
+                conversation_id="conv-hard",
+                idle_timeout_seconds=2.0,
+                hard_timeout_seconds=0.35,
+            )
+            self.assertEqual(res_hard.status, "TIMEOUT")
+            self.assertIn("hard ceiling", res_hard.error)
 
     def test_hook_approve_watcher_briefing_denies_all_tools_first(self) -> None:
         env = {k: v for k, v in os.environ.items() if k != "AGY_BRIDGE_ORIGIN"}
@@ -780,6 +927,91 @@ class HealthAndRunnerLifecycleTests(unittest.TestCase):
                     assert m_resumed is not None
                     self.assertEqual(m_resumed["status"], "active")
                     self.assertIsNone(m_resumed["lifecycle"]["expires_at"])
+
+                    # Consecutive failure escalation (silent warning at >=2, no duplicate at 3, silent recovery!)
+                    feed_srv = _MockFeedServer()
+                    try:
+                        # Start with broken RSS endpoint (404)
+                        m_fail = validate_mission(
+                            {
+                                "id": mid,
+                                "title": "MV Piano 6yo",
+                                "status": "active",
+                                "kind": "rss",
+                                "created_at": "2026-11-01T08:00:00Z",
+                                "schedule": {"interval_minutes": 15},
+                                "config": {"url": f"{feed_srv.base_url}/missing"},
+                                "notify": {
+                                    "priority": "normal",
+                                    "quiet_hours": None,
+                                    "target": m_resumed["notify"]["target"],
+                                },
+                            }
+                        )
+                        atomic_write_json(mission_path(cfg.watcher_missions_dir, mid), cfg.watcher_missions_dir, m_fail)
+                        wcfg_live = WatcherRuntimeConfig(
+                            ipc_host="127.0.0.1",
+                            ipc_port=port,
+                            watcher_token_path=cfg.watcher_token_path,
+                            timezone_name="America/Los_Angeles",
+                            quiet_start="23:00",
+                            quiet_end="08:00",
+                            max_daily_web_scouts=2,
+                            agy_bin="agy",
+                            agy_model="",
+                            agy_brain_dir=root / "brain",
+                            scout_sandbox_dir=root / "scout",
+                            missions_dir=cfg.watcher_missions_dir,
+                            state_dir=cfg.watcher_state_dir,
+                            triggers_dir=cfg.watcher_triggers_dir,
+                        )
+                        wrunner = WatcherRunner(wcfg_live, allow_loopback_for_tests=True)
+
+                        # Server-side rejects failure_alert with failures < 2
+                        c_low, b_low = post_bridge_ipc(
+                            "127.0.0.1",
+                            port,
+                            cfg.watcher_token_path,
+                            "/watcher",
+                            {"mission_id": mid, "event_type": "failure_alert", "consecutive_failures": 1},
+                        )
+                        self.assertEqual(c_low, 400)
+                        self.assertEqual(b_low.get("error"), "failure_threshold_not_met")
+
+                        before_f1 = len(tg.sent_messages)
+                        base_ts = 1795800000.0
+                        # Failure #1: silent (0 alerts)
+                        f1 = wrunner.run_single_mission(mid, now_ts=base_ts, force=True)
+                        self.assertEqual(f1["outcome"], "collector_failed")
+                        self.assertEqual(len(tg.sent_messages), before_f1)
+
+                        # Failure #2: sends 1 silent [Watch Warning] into Mission Topic
+                        f2 = wrunner.run_single_mission(mid, now_ts=base_ts + 4000, force=True)
+                        self.assertEqual(f2["outcome"], "collector_failed")
+                        self.assertEqual(len(tg.sent_messages), before_f1 + 1)
+                        warn_msg = tg.sent_messages[-1]
+                        self.assertIn("[Watch Warning]", warn_msg["text"])
+                        self.assertEqual(warn_msg["thread_id"], tid)
+                        self.assertTrue(warn_msg["disable_notification"])
+                        self.assertEqual(warn_msg["link_preview_options"], {"is_disabled": True})
+
+                        # Failure #3: does NOT spam a duplicate warning
+                        f3 = wrunner.run_single_mission(mid, now_ts=base_ts + 12000, force=True)
+                        self.assertEqual(f3["outcome"], "collector_failed")
+                        self.assertEqual(len(tg.sent_messages), before_f1 + 1)
+
+                        # Feed recovers (empty valid RSS -> no_change): sends 1 silent [Watch Recovered]
+                        feed_srv.routes["/missing"] = (200, {}, b"<rss><channel></channel></rss>")
+                        rec = wrunner.run_single_mission(mid, now_ts=base_ts + 25000, force=True)
+                        self.assertEqual(rec["outcome"], "no_change")
+                        self.assertEqual(len(tg.sent_messages), before_f1 + 2)
+                        rec_msg = tg.sent_messages[-1]
+                        self.assertIn("[Watch Recovered]", rec_msg["text"])
+                        self.assertEqual(rec_msg["thread_id"], tid)
+                        self.assertTrue(rec_msg["disable_notification"])
+                        self.assertFalse(load_safe_state(cfg.watcher_state_dir, m_fail)["failure_alerted"])
+                    finally:
+                        feed_srv.close()
                 finally:
                     srv.shutdown()
                     srv.server_close()

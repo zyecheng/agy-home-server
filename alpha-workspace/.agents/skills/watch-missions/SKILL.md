@@ -26,8 +26,8 @@ Follow this 4-step workflow whenever the user asks you to monitor, scout, track,
 ## 2. Clarify Ambiguity Before Activating
 - For **vague or open-ended requests** (e.g., *"watch for piano lessons for a 6-year-old around Mountain View"*), ask **at most 2–3 high-leverage questions**:
   1. Scope/format preferences (e.g., 1-on-1 vs. group, age/skill, distance/budget).
-  2. Exclusions (what to ignore so alerts stay high-signal).
-  3. Preferred cadence or expiry window (if seasonal).
+  2. Exclusions (what to ignore so alerts stay high-signal) & cadence/expiry window.
+  3. **Scouting depth (`effort`):** Only ask if it is not obvious from the request — e.g., quick surface scan (`low`, ~30–50s, best for routine listings/deals/openings) vs. deeper multi-source research (`medium` or `high`, best for policy comparisons or nuanced analysis).
 - For **crystal-clear requests** (e.g., *"watch GitHub repo owner/name releases for hooks changes"*), skip unnecessary interrogation and propose the concrete mission spec immediately.
 
 ## 3. Pick the Lightest Viable Collector Tier & Activate
@@ -35,7 +35,7 @@ Always prefer deterministic Tier-A collectors (0 LLM tokens when unchanged) over
 - `"rss"`: RSS/Atom feed (`config.url`, optional `match_keywords`, `max_items`; interval `>= 15` min).
 - `"github_releases"`: GitHub repo releases (`config.repo: "owner/name"`, optional `include_prereleases`, `match_keywords`; interval `>= 15` min).
 - `"http_diff"`: Public webpage/portal change tracker (`config.url`, optional `regex`, `match_keywords`; interval `>= 15` min).
-- `"web_scout"`: Open-ended web discovery (`config.queries`: 1–4 search strings, `max_items`; interval `>= 60` min).
+- `"web_scout"`: Open-ended web discovery (`config.queries`: 1–4 search strings, `max_items`, optional `effort`: `"low"` | `"medium"` | `"high"` [default `"low"`], optional `max_searches`: `1..15` [default `5`]; interval `>= 60` min).
 
 Write/update `watchers/missions/<mission_id>.json` with `"status": "active"`, clear `relevance_criteria`, explicit `exclusions`, and valid `schedule.interval_minutes` (leaving `notify.target` intact!). Never edit or read raw scraped caches under `watchers/state/*.pending.json`.
 

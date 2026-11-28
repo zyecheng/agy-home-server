@@ -270,7 +270,10 @@ Verified empirically on `agy-staging` (`agy 1.5.18`): `--json-schema` enforces s
 1. `watcher_runner.py` reuses `server/agy_runner.py` (`build_scrubbed_env` and a lightweight `run_agy_prompt` / `AgyRunner` accepting CLI fields without requiring `TELEGRAM_BOT_TOKEN`) with:
    - `cwd = ~/agy-scout-sandbox/` (read-only directory containing **only** `.agents/hooks.json` and `.agents/settings.json`).
    - `bridge_origin = False` and scrubbed environment (`TELEGRAM_*`, `BRIDGE_IPC_*`, `AGY_BRIDGE_*`, `WATCHER_*` stripped).
-   - `--output-format json --disable-slash-commands --print-timeout 150s`
+   - `--output-format stream-json --disable-slash-commands --effort <low|medium|high> --print-timeout 900s`
+   - **Progress-based idle timeout + hard ceiling:** `AgyRunner` reads `stream-json` NDJSON events line-by-line and resets the idle timer on every event (`120s` for `low`, `180s` for `medium`, `240s` for `high`), paired with a `900s` hard safety ceiling — so active deep scouts are never aborted prematurely by a tight wall-clock cap.
+   - **Deterministic work budget (`config.max_searches`, default `5`, cap `15`):** `collect_web_scout` passes a per-run private temp counter (`AGY_SCOUT_MAX_SEARCHES` / `AGY_SCOUT_COUNTER_FILE`); once the scout reaches `max_searches`, `hook_scout_guard.py` denies further `search_web` calls with a graceful wrap-up directive so the scout immediately calls `finish` with all gathered findings.
+   - **Consecutive-failure escalation:** After `consecutive_failures >= 2`, `watcher_runner.py` posts a single silent (`disable_notification=True`) warning into the Mission Topic (`event_type: "failure_alert"`), followed by a silent recovery note (`event_type: "failure_recovered"`) once healthy again.
    - `--settings ~/agy-scout-sandbox/.agents/settings.json` pinning strict review policy.
    - `--json-schema <scout_output_schema.json>` requiring `items` (max 10 objects: `key`, `title`, `url`, `summary`, `confidence`) and `notes`.
    - Prompt includes mission `queries`, `relevance_criteria`, `exclusions`, and (wrapped inside a random-nonce `<known_keys_HEX>` block) ONLY previously validated slug keys (`^[a-z0-9][a-z0-9_-]{0,63}$`, max 30 keys — zero free-form attacker prose).

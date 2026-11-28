@@ -99,6 +99,7 @@ def main() -> int:
     parser.add_argument("--disable-slash-commands", action="store_true")
     parser.add_argument("--print-timeout", default="")
     parser.add_argument("--model", default="")
+    parser.add_argument("--effort", default="")
     parser.add_argument("--json-schema", dest="json_schema", default="")
     parser.add_argument("--settings", dest="settings", default="")
     ns, _unknown = parser.parse_known_args()
@@ -163,16 +164,18 @@ def main() -> int:
         )
         tpath = brain_dir / conv_id / ".system_generated" / "logs" / "transcript_full.jsonl"
         _append_steps(tpath, [{"type": "PLANNER_RESPONSE", "status": "DONE", "content": json.dumps(out_obj)}])
-        print(
-            json.dumps(
-                {
-                    "conversation_id": conv_id,
-                    "status": "SUCCESS",
-                    "response": json.dumps(out_obj),
-                    "structured_output": out_obj,
-                }
-            )
-        )
+        result_obj = {
+            "conversation_id": conv_id,
+            "status": "SUCCESS",
+            "response": json.dumps(out_obj),
+            "structured_output": out_obj,
+        }
+        if ns.output_format == "stream-json":
+            print(json.dumps({"event": "init", "conversation_id": conv_id}), flush=True)
+            print(json.dumps({"event": "step_update", "step_update": {"state": "DONE"}}), flush=True)
+            print(json.dumps({"event": "result", "result": result_obj}), flush=True)
+        else:
+            print(json.dumps(result_obj))
         return 0
 
     # Stage-2 ephemeral watcher briefing mode (AGY_WATCHER_BRIEFING=1)

@@ -25,6 +25,10 @@ _SAFE_ERR_RE = re.compile(r"[^A-Za-z0-9_.:/\- ]+")
 VALID_STATUSES = ("scoping", "active", "paused", "archived")
 VALID_KINDS = ("rss", "github_releases", "http_diff", "web_scout")
 VALID_PRIORITIES = ("normal", "urgent")
+VALID_EFFORTS = ("low", "medium", "high")
+EFFORT_IDLE_TIMEOUTS: dict[str, int] = {"low": 120, "medium": 180, "high": 240}
+DEFAULT_MAX_SEARCHES = 5
+MAX_SEARCHES_CAP = 15
 
 MIN_INTERVAL_MINUTES: dict[str, int] = {
     "rss": 15,
@@ -316,6 +320,25 @@ def validate_mission(
                 raise MissionValidationError(
                     "web_scout mission requires config.queries with 1 to 4 non-empty strings (<=250 chars)"
                 )
+            raw_eff = str(cfg.get("effort") or "low").strip().lower()
+            if raw_eff not in VALID_EFFORTS:
+                raise MissionValidationError(
+                    f"web_scout config.effort {raw_eff!r} must be one of {VALID_EFFORTS}"
+                )
+            cfg = dict(cfg)
+            cfg["effort"] = raw_eff
+            if "max_searches" in cfg and cfg["max_searches"] is not None:
+                if isinstance(cfg["max_searches"], bool):
+                    raise MissionValidationError("web_scout config.max_searches must be an integer")
+                try:
+                    ms = int(cfg["max_searches"])
+                except (TypeError, ValueError) as exc:
+                    raise MissionValidationError("web_scout config.max_searches must be an integer") from exc
+                if ms < 1 or ms > MAX_SEARCHES_CAP:
+                    raise MissionValidationError(
+                        f"web_scout config.max_searches ({ms}) must be between 1 and {MAX_SEARCHES_CAP}"
+                    )
+                cfg["max_searches"] = ms
 
     notify = data.get("notify") if isinstance(data.get("notify"), dict) else {}
     priority = str(notify.get("priority") or "normal").strip()
@@ -403,6 +426,7 @@ def default_state(mission: dict[str, Any], *, now: float | None = None) -> dict[
         "last_notified_at": 0.0,
         "last_checkin_at": created_ts,
         "consecutive_failures": 0,
+        "failure_alerted": False,
         "last_error": "",
         "http_etag": "",
         "http_last_modified": "",
@@ -485,6 +509,7 @@ def load_safe_state(state_dir: Path, mission: dict[str, Any]) -> dict[str, Any]:
         merged[fk] = _safe_float(raw.get(fk), 0.0)
     merged["last_checkin_at"] = _safe_float(raw.get("last_checkin_at"), base["last_checkin_at"]) or base["last_checkin_at"]
     merged["consecutive_failures"] = _safe_int(raw.get("consecutive_failures"), 0)
+    merged["failure_alerted"] = bool(raw.get("failure_alerted") is True)
     merged["pending_count"] = min(MAX_PENDING_ITEMS, _safe_int(raw.get("pending_count"), 0))
 
     raw_err = raw.get("last_error")
