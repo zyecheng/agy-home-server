@@ -71,6 +71,7 @@ RECOVERY_TIMEOUT_SECONDS = 45
 INBOX_PRUNE_INTERVAL_SECONDS = 6 * 3600.0
 TOPIC_CREATE_RATE_LIMIT = 5
 TOPIC_CREATE_WINDOW_SECONDS = 60.0
+STAGE2_MAX_CONCURRENT = 2
 
 _MD_LINK_RE = re.compile(r"\[([^\]\r\n]+)\]\(((?:https?|tg)://[^)\s\"<>]+)\)", re.IGNORECASE)
 _BARE_URL_RE = re.compile(
@@ -198,8 +199,10 @@ class BridgeRouter:
         self._topic_create_times: deque[float] = deque()
 
         # Active ephemeral Stage-2 subprocesses for instant cancellation on SIGTERM
+        # + bounded concurrency semaphore so simultaneous watcher deltas never spike RAM
         self._stage2_procs_guard = threading.Lock()
         self._stage2_procs: set[subprocess.Popen] = set()
+        self._stage2_sem = threading.BoundedSemaphore(STAGE2_MAX_CONCURRENT)
 
         # Track active bridge runs and external SSH runs per agy conversation_id
         self._state_guard = threading.Lock()
@@ -1941,7 +1944,17 @@ class BridgeRouter:
             with self._stage2_procs_guard:
                 self._stage2_procs.discard(proc)
 
+        acquired_stage2 = False
+        while not self._shutting_down.is_set():
+            if self._stage2_sem.acquire(timeout=0.25):
+                acquired_stage2 = True
+                break
+        if not acquired_stage2:
+            return {"status": "shutting_down"}
+
         try:
+            if self._shutting_down.is_set():
+                return {"status": "shutting_down"}
             result = self.runner.run_prompt(
                 prompt,
                 conversation_id=None,  # Strictly ephemeral stateless turn — NEVER taints interactive sessions
@@ -1956,6 +1969,8 @@ class BridgeRouter:
         except Exception as exc:
             log.exception("Stage-2 watcher runner crashed for %s", mid)
             return {"status": "failed", "detail": f"stage2_runner_error:{type(exc).__name__}"}
+        finally:
+            self._stage2_sem.release()
 
         if result.conversation_id:
             prune_ephemeral_brain_dir(self.config.agy_brain_dir, result.conversation_id)

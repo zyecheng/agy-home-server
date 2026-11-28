@@ -12,7 +12,9 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -53,6 +55,8 @@ except ImportError:  # Windows unit tests
 log = logging.getLogger("agy-bridge.watchers.runner")
 
 MAX_WEB_SCOUTS_PER_TICK = 3
+MAX_CONCURRENT_FAST = 4
+MAX_CONCURRENT_SCOUTS = 2
 MAX_BACKOFF_SECONDS = 24 * 3600
 WATCHER_IPC_TIMEOUT_SECONDS = 125.0
 FAILURE_ALERT_THRESHOLD = 2
@@ -179,9 +183,28 @@ class WatcherRunner:
         *,
         allow_loopback_for_tests: bool = False,
         agy_runner: AgyRunner | None = None,
+        max_concurrent_fast: int | None = None,
+        max_concurrent_scouts: int | None = None,
     ) -> None:
         self.config = config
         self.allow_loopback_for_tests = allow_loopback_for_tests
+        self.max_concurrent_fast = max(
+            1,
+            int(
+                config.max_concurrent_fast
+                if max_concurrent_fast is None
+                else max_concurrent_fast
+            ),
+        )
+        self.max_concurrent_scouts = max(
+            1,
+            int(
+                config.max_concurrent_scouts
+                if max_concurrent_scouts is None
+                else max_concurrent_scouts
+            ),
+        )
+        self._scout_budget_lock = threading.Lock()
         self.agy_runner = agy_runner or AgyRunner.from_cli_settings(
             agy_bin=config.agy_bin,
             agy_model=config.agy_model,
@@ -501,15 +524,16 @@ class WatcherRunner:
                 }
 
             if mission["kind"] == "web_scout":
-                if scout_budget_remaining is not None and scout_budget_remaining[0] <= 0:
-                    return {"mission_id": mid, "outcome": "tick_budget_deferred"}
-                if not self._consume_daily_web_scout_quota(now):
-                    state["last_error"] = "daily_web_scout_quota_reached"
-                    state["next_run_at"] = now + 3600
-                    atomic_write_json(sfile, self.config.state_dir, state)
-                    return {"mission_id": mid, "outcome": "daily_quota_exceeded"}
-                if scout_budget_remaining is not None:
-                    scout_budget_remaining[0] -= 1
+                with self._scout_budget_lock:
+                    if scout_budget_remaining is not None and scout_budget_remaining[0] <= 0:
+                        return {"mission_id": mid, "outcome": "tick_budget_deferred"}
+                    if not self._consume_daily_web_scout_quota(now):
+                        state["last_error"] = "daily_web_scout_quota_reached"
+                        state["next_run_at"] = now + 3600
+                        atomic_write_json(sfile, self.config.state_dir, state)
+                        return {"mission_id": mid, "outcome": "daily_quota_exceeded"}
+                    if scout_budget_remaining is not None:
+                        scout_budget_remaining[0] -= 1
 
             # Merge pending seen_ids/known_entities into collector view so quiet-hours ticks never duplicate items
             existing_pending = self._load_pending(mid)
@@ -628,19 +652,19 @@ class WatcherRunner:
             ]
 
         triggered_ids = self.drain_triggers()
-        results: list[dict[str, Any]] = []
+        work_items: list[tuple[str, bool, bool]] = []
         processed: set[str] = set()
 
         for mid in triggered_ids:
             processed.add(mid)
-            results.append(
-                self.run_single_mission(
-                    mid,
-                    now_ts=now,
-                    force=True,
-                    scout_budget_remaining=scout_budget,
+            try:
+                trig_mission = load_mission(
+                    self.config.missions_dir, mid, require_runnable=False
                 )
-            )
+            except MissionValidationError:
+                trig_mission = None
+            is_scout = bool(trig_mission is not None and trig_mission.get("kind") == "web_scout")
+            work_items.append((mid, True, is_scout))
 
         missions = [m for m in list_missions(self.config.missions_dir) if m["status"] == "active"]
 
@@ -654,14 +678,73 @@ class WatcherRunner:
             mid = str(m["id"])
             if mid in processed:
                 continue
-            results.append(
+            work_items.append((mid, force, m.get("kind") == "web_scout"))
+
+        if not work_items:
+            return []
+
+        if len(work_items) == 1:
+            mid, item_force, _is_scout = work_items[0]
+            return [
                 self.run_single_mission(
                     mid,
                     now_ts=now,
-                    force=force,
+                    force=item_force,
                     scout_budget_remaining=scout_budget,
                 )
+            ]
+
+        has_fast = any(not is_scout for _mid, _f, is_scout in work_items)
+        has_scout = any(is_scout for _mid, _f, is_scout in work_items)
+        futures: list[tuple[str, Future[dict[str, Any]]]] = []
+        results: list[dict[str, Any]] = []
+
+        with contextlib.ExitStack() as stack:
+            fast_pool = (
+                stack.enter_context(
+                    ThreadPoolExecutor(
+                        max_workers=self.max_concurrent_fast,
+                        thread_name_prefix="watcher-fast",
+                    )
+                )
+                if has_fast
+                else None
             )
+            scout_pool = (
+                stack.enter_context(
+                    ThreadPoolExecutor(
+                        max_workers=self.max_concurrent_scouts,
+                        thread_name_prefix="watcher-scout",
+                    )
+                )
+                if has_scout
+                else None
+            )
+
+            for mid, item_force, is_scout in work_items:
+                pool = scout_pool if is_scout else fast_pool
+                assert pool is not None
+                fut = pool.submit(
+                    self.run_single_mission,
+                    mid,
+                    now_ts=now,
+                    force=item_force,
+                    scout_budget_remaining=scout_budget,
+                )
+                futures.append((mid, fut))
+
+            for mid, fut in futures:
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    log.exception("Unhandled watcher worker error for %s", mid)
+                    results.append(
+                        {
+                            "mission_id": mid,
+                            "outcome": "runner_error",
+                            "detail": _sanitize_error_code(exc),
+                        }
+                    )
         return results
 
 

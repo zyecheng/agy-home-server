@@ -247,7 +247,7 @@ Managed exclusively by `watcher_runner.py` under per-mission `flock` (`watchers/
 - **Two independent due checks per tick:**
   1. **Pending delivery flush:** Any `active` mission with `pending_count > 0` (`<id>.pending.json` non-empty) that is now **outside quiet hours** (or `priority == "urgent"`) flushes immediately — **decoupled from `next_run_at`** so a weekly mission that ran at 23:30 flushes at 08:00 the next morning.
   2. **Collection due:** Triggered missions first, then due `active` missions (`now >= next_run_at`) sorted by `(priority != "urgent", kind == "web_scout", next_run_at)` — ensuring fast deterministic Tier-A checks run ahead of slower `web_scout` turns.
-- **Per-tick budget:** At most `3` `web_scout` missions run per 5-minute tick.
+- **Tier-split bounded concurrency & per-tick budget:** Inside each tick, `watcher_runner.py` runs Tier-A deterministic missions (`rss`, `github_releases`, `http_diff`) and Tier-B `web_scout` missions on separate bounded `ThreadPoolExecutor` pools in parallel (`WATCHER_MAX_CONCURRENT_FAST=4`, `WATCHER_MAX_CONCURRENT_SCOUTS=2`) with a thread-safe lock around per-tick (`MAX_WEB_SCOUTS_PER_TICK=3`) and daily `web_scout` quota accounting. Fast Tier-A checks never block behind slow `web_scout` runs, while simultaneous `agy -p` subprocesses stay hard-capped for small-RAM hosts.
 - **Per-mission locking:** Each mission acquires `watchers/state/<id>.lock` (`flock(LOCK_EX | LOCK_NB)`), skipping cleanly if already locked.
 - **Expiry & Check-in:**
   - If `lifecycle.expires_at` is set and `now >= expires_at`: runner calls `POST /watcher` (`event_type: "expired"`). The bridge verifies `now >= mission.lifecycle.expires_at` server-side before archiving (`status = "archived"` + `closeForumTopic`) and sending a concise expiry notice.
@@ -306,8 +306,8 @@ Verified empirically on `agy-staging` (`agy 1.5.18`): `--json-schema` enforces s
    - If Telegram returns HTTP 400 (`message thread not found` / topic deleted), sets mission `status = "paused"`, notifies `primary_dm` once, and returns `{"status": "failed", "detail": "topic_deleted"}`.
    - For `event_type == "expired"`: verifies `now >= mission.lifecycle.expires_at` server-side before archiving & notifying.
    - For `event_type == "checkin"`: verifies `mission.lifecycle.checkin_after_days > 0` server-side before sending the deterministic 0-LLM check-in prompt.
-3. **Ephemeral Stage-2 Judge, Bounded Timeout & Clean Shutdown:**
-   - Runs a **fresh, stateless `agy -p` turn** (never `--conversation <topic_id>` or `<dm_id>`) with `AGY_WATCHER_BRIEFING=1`, `_recover_failed_turn` **disabled**, and a strict **35s timeout** (`WATCHER_STAGE2_TIMEOUT_SECONDS = 35`, strictly below both `post_bridge_ipc`'s 60s client timeout and systemd `TimeoutStopSec=45`).
+3. **Ephemeral Stage-2 Judge, Bounded Concurrency & Clean Shutdown:**
+   - Runs a **fresh, stateless `agy -p` turn** (never `--conversation <topic_id>` or `<dm_id>`) with `AGY_WATCHER_BRIEFING=1`, `_recover_failed_turn` **disabled**, a bounded `STAGE2_MAX_CONCURRENT=2` semaphore (shutdown-aware so queued requests return `503` immediately on `SIGTERM`), and a bounded timeout (`WATCHER_STAGE2_TIMEOUT_SECONDS`, default `90s`, strictly below `WATCHER_IPC_TIMEOUT_SECONDS = 125s`).
    - `BridgeRouter` registers each active Stage-2 `subprocess.Popen` handle; on `begin_shutdown()`, all in-flight Stage-2 subprocesses are terminated (`SIGTERM`, then `SIGKILL` after 2s) and their HTTP handlers return `503` immediately so `ipc.server_close()` never stalls daemon shutdown!
    - Prompt wraps Stage-1 items inside per-turn random-nonce delimiters `<untrusted_data_HEX>...</untrusted_data_HEX>` (neutralizing closing-tag variants), evaluates strictly against authoritative `relevance_criteria` & `exclusions`, and instructs exact `NO_ALERT` if nothing warrants notifying.
    - **Fail-closed `server/hook_approve.py` (evaluated FIRST — before `AGY_BRIDGE_ORIGIN` and `SAFE_READ_ONLY_TOOLS`!):**

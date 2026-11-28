@@ -227,6 +227,8 @@ class WatcherRuntimeConfig:
     missions_dir: Path
     state_dir: Path
     triggers_dir: Path
+    max_concurrent_fast: int = 4
+    max_concurrent_scouts: int = 2
 
     @classmethod
     def from_env(
@@ -258,6 +260,12 @@ class WatcherRuntimeConfig:
         missions_dir = Path(get("WATCHER_MISSIONS_DIR", str(alpha_ws / "watchers" / "missions")))
         state_dir = Path(get("WATCHER_STATE_DIR", str(alpha_ws / "watchers" / "state")))
         triggers_dir = Path(get("WATCHER_TRIGGERS_DIR", str(alpha_ws / "watchers" / "triggers")))
+        max_concurrent_fast = max(
+            1, min(16, _parse_int(get("WATCHER_MAX_CONCURRENT_FAST", "4"), 4))
+        )
+        max_concurrent_scouts = max(
+            1, min(4, _parse_int(get("WATCHER_MAX_CONCURRENT_SCOUTS", "2"), 2))
+        )
 
         return cls(
             ipc_host=ipc_host,
@@ -278,6 +286,8 @@ class WatcherRuntimeConfig:
             missions_dir=missions_dir,
             state_dir=state_dir,
             triggers_dir=triggers_dir,
+            max_concurrent_fast=max_concurrent_fast,
+            max_concurrent_scouts=max_concurrent_scouts,
         )
 
 
@@ -311,6 +321,8 @@ class BridgeConfig:
     watcher_quiet_start: str = "23:00"
     watcher_quiet_end: str = "08:00"
     max_daily_web_scouts: int = 12
+    watcher_max_concurrent_fast: int = 4
+    watcher_max_concurrent_scouts: int = 2
     watcher_stage2_timeout_seconds: int = 90
 
     @property
@@ -372,6 +384,8 @@ class BridgeConfig:
             f"WATCHER_QUIET_START={self.watcher_quiet_start}",
             f"WATCHER_QUIET_END={self.watcher_quiet_end}",
             f"MAX_DAILY_WEB_SCOUTS={self.max_daily_web_scouts}",
+            f"WATCHER_MAX_CONCURRENT_FAST={self.watcher_max_concurrent_fast}",
+            f"WATCHER_MAX_CONCURRENT_SCOUTS={self.watcher_max_concurrent_scouts}",
             f"AGY_BIN={self.agy_bin}",
             f"AGY_MODEL={self.agy_model}",
             f"AGY_BRAIN_DIR={self.agy_brain_dir}",
@@ -438,6 +452,12 @@ class BridgeConfig:
         stage2_timeout = max(
             10, min(180, _parse_int(get("WATCHER_STAGE2_TIMEOUT_SECONDS", "90"), 90))
         )
+        max_concurrent_fast = max(
+            1, min(16, _parse_int(get("WATCHER_MAX_CONCURRENT_FAST", "4"), 4))
+        )
+        max_concurrent_scouts = max(
+            1, min(4, _parse_int(get("WATCHER_MAX_CONCURRENT_SCOUTS", "2"), 2))
+        )
 
         return cls(
             telegram_bot_token=get("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -474,5 +494,7 @@ class BridgeConfig:
             watcher_quiet_start=get("WATCHER_QUIET_START", "23:00").strip(),
             watcher_quiet_end=get("WATCHER_QUIET_END", "08:00").strip(),
             max_daily_web_scouts=max(0, _parse_int(get("MAX_DAILY_WEB_SCOUTS", "12"), 12)),
+            watcher_max_concurrent_fast=max_concurrent_fast,
+            watcher_max_concurrent_scouts=max_concurrent_scouts,
             watcher_stage2_timeout_seconds=stage2_timeout,
         )

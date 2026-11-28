@@ -12,11 +12,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from server.agy_runner import AgyRunner
+from server.agy_runner import AgyResult, AgyRunner
 from server.bot import start_ipc_server
 from server.config import (
     BridgeConfig,
@@ -29,6 +31,7 @@ from server.hook_scout_guard import evaluate_tool_call
 from server.router import BridgeRouter, InboundMessage, sanitize_stage2_links
 from server.telegram_client import TelegramClient
 from server.watchers.collectors import (
+    CollectResult,
     collect_github_releases,
     collect_http_diff,
     collect_rss,
@@ -1016,6 +1019,226 @@ class HealthAndRunnerLifecycleTests(unittest.TestCase):
                     srv.shutdown()
                     srv.server_close()
                     store.close()
+        finally:
+            tg.close()
+
+    def test_bounded_concurrency_tier_isolation_and_scout_budget_thread_safety(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "alpha"
+            missions_dir = ws / "watchers" / "missions"
+            state_dir = ws / "watchers" / "state"
+            triggers_dir = ws / "watchers" / "triggers"
+            missions_dir.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            triggers_dir.mkdir(parents=True)
+
+            # 3 Tier-A rss missions + 4 Tier-B web_scout missions (all due simultaneously)
+            for i in range(1, 4):
+                m = validate_mission(
+                    {
+                        "id": f"fast-{i}",
+                        "title": f"Fast {i}",
+                        "status": "active",
+                        "kind": "rss",
+                        "schedule": {"interval_minutes": 15},
+                        "config": {"url": f"https://example.test/feed-{i}.xml"},
+                    }
+                )
+                atomic_write_json(mission_path(missions_dir, m["id"]), missions_dir, m)
+            for i in range(1, 5):
+                m = validate_mission(
+                    {
+                        "id": f"scout-{i}",
+                        "title": f"Scout {i}",
+                        "status": "active",
+                        "kind": "web_scout",
+                        "schedule": {"interval_minutes": 60},
+                        "config": {"queries": [f"query {i}"]},
+                    }
+                )
+                atomic_write_json(mission_path(missions_dir, m["id"]), missions_dir, m)
+
+            # Trigger scout-1 so it is submitted first in work_items ahead of fast-* missions
+            write_trigger_file(triggers_dir, "scout-1")
+
+            w_tok = root / "watcher.token"
+            ensure_ipc_token(w_tok)
+            wcfg = WatcherRuntimeConfig(
+                ipc_host="127.0.0.1",
+                ipc_port=1,
+                watcher_token_path=w_tok,
+                timezone_name="America/Los_Angeles",
+                quiet_start="23:00",
+                quiet_end="08:00",
+                max_daily_web_scouts=10,
+                agy_bin="agy",
+                agy_model="",
+                agy_brain_dir=root / "brain",
+                scout_sandbox_dir=root / "scout",
+                missions_dir=missions_dir,
+                state_dir=state_dir,
+                triggers_dir=triggers_dir,
+                max_concurrent_fast=4,
+                max_concurrent_scouts=2,
+            )
+            runner = WatcherRunner(wcfg, allow_loopback_for_tests=True)
+
+            guard = threading.Lock()
+            active = {"fast": 0, "scout": 0}
+            peak = {"fast": 0, "scout": 0}
+            fast_done_at: dict[str, float] = {}
+            scout_done_at: dict[str, float] = {}
+            scout_pair_barrier = threading.Barrier(2)
+            fast_pair_barrier = threading.Barrier(2)
+            scouts_seen = 0
+            fasts_seen = 0
+
+            def _fake_collector(mission: dict, state: dict) -> CollectResult:
+                nonlocal scouts_seen, fasts_seen
+                tier = "scout" if mission["kind"] == "web_scout" else "fast"
+                with guard:
+                    active[tier] += 1
+                    peak[tier] = max(peak[tier], active[tier])
+                    if tier == "scout":
+                        scouts_seen += 1
+                        my_idx = scouts_seen
+                    else:
+                        fasts_seen += 1
+                        my_idx = fasts_seen
+                try:
+                    if tier == "scout":
+                        if my_idx <= 2:
+                            # Proves 2 web_scouts truly overlap concurrently
+                            scout_pair_barrier.wait(timeout=3.0)
+                        time.sleep(0.25)
+                        with guard:
+                            scout_done_at[mission["id"]] = time.monotonic()
+                    else:
+                        if my_idx <= 2:
+                            fast_pair_barrier.wait(timeout=3.0)
+                        time.sleep(0.03)
+                        with guard:
+                            fast_done_at[mission["id"]] = time.monotonic()
+                    return CollectResult(not_modified=True)
+                finally:
+                    with guard:
+                        active[tier] -= 1
+
+            runner._run_collector = _fake_collector  # type: ignore[method-assign]
+            results = runner.run_tick(now_ts=1795800000.0)
+
+            self.assertEqual(len(results), 7)
+            # Triggered scout-1 stays first in deterministic result order
+            self.assertEqual(results[0]["mission_id"], "scout-1")
+            by_id = {r["mission_id"]: r["outcome"] for r in results}
+
+            # All 3 Tier-A missions succeeded and finished BEFORE any slow web_scout finished
+            for i in range(1, 4):
+                self.assertEqual(by_id[f"fast-{i}"], "no_change")
+            self.assertLess(max(fast_done_at.values()), min(scout_done_at.values()))
+
+            # Concurrency bounds strictly respected on both pools
+            self.assertEqual(peak["scout"], 2)
+            self.assertGreaterEqual(peak["fast"], 2)
+            self.assertLessEqual(peak["fast"], 4)
+
+            # Exactly 3 web_scouts ran (MAX_WEB_SCOUTS_PER_TICK=3); 4th cleanly deferred
+            scout_outcomes = [by_id[f"scout-{i}"] for i in range(1, 5)]
+            self.assertEqual(scout_outcomes.count("no_change"), 3)
+            self.assertEqual(scout_outcomes.count("tick_budget_deferred"), 1)
+
+    def test_stage2_bounded_concurrency_and_shutdown_unblock(self) -> None:
+        tg = MockTelegramServer()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                cfg = self._make_config(root, token=tg.expected_token, api_base_url=tg.base_url)
+                store = BridgeStore(cfg.db_path)
+                store.get_or_create_binding("telegram", "111", 0, "private", str(cfg.alpha_workspace))
+
+                mission = validate_mission(
+                    {
+                        "id": "conc-m",
+                        "title": "Concurrent Stage2 Test",
+                        "status": "active",
+                        "kind": "rss",
+                        "schedule": {"interval_minutes": 15},
+                        "config": {"url": "https://example.test/feed.xml"},
+                    }
+                )
+                atomic_write_json(
+                    mission_path(cfg.watcher_missions_dir, "conc-m"),
+                    cfg.watcher_missions_dir,
+                    mission,
+                )
+
+                guard = threading.Lock()
+                active = 0
+                peak = 0
+                calls = 0
+                pair_barrier = threading.Barrier(2)
+
+                class _FakeStage2Runner:
+                    def run_prompt(self, prompt: str, **_kwargs) -> AgyResult:
+                        nonlocal active, peak, calls
+                        with guard:
+                            active += 1
+                            peak = max(peak, active)
+                            calls += 1
+                            idx = calls
+                        try:
+                            if idx <= 2:
+                                pair_barrier.wait(timeout=3.0)
+                            time.sleep(0.12)
+                            return AgyResult(
+                                conversation_id="",
+                                status="SUCCESS",
+                                response="Update available at https://example.test/item",
+                            )
+                        finally:
+                            with guard:
+                                active -= 1
+
+                router = BridgeRouter(
+                    cfg,
+                    store,
+                    _FakeStage2Runner(),  # type: ignore[arg-type]
+                    TelegramClient(tg.expected_token, api_base_url=tg.base_url),
+                )
+                payload = {
+                    "mission_id": "conc-m",
+                    "event_type": "delta",
+                    "items": [
+                        {
+                            "title": "New Release",
+                            "url": "https://example.test/item",
+                            "summary": "Details",
+                        }
+                    ],
+                }
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    outs = list(pool.map(lambda _i: router.handle_watcher_event(payload), range(4)))
+                self.assertEqual([o["status"] for o in outs], ["delivered"] * 4)
+                self.assertEqual(peak, 2)
+
+                # Queued Stage-2 caller unblocks promptly on begin_shutdown()
+                self.assertTrue(router._stage2_sem.acquire(blocking=False))
+                self.assertTrue(router._stage2_sem.acquire(blocking=False))
+                holder: list[dict] = []
+                t = threading.Thread(target=lambda: holder.append(router.handle_watcher_event(payload)))
+                t.start()
+                time.sleep(0.05)
+                t0 = time.monotonic()
+                router.begin_shutdown()
+                t.join(timeout=2.0)
+                elapsed = time.monotonic() - t0
+                router._stage2_sem.release()
+                router._stage2_sem.release()
+                self.assertFalse(t.is_alive())
+                self.assertLess(elapsed, 1.5)
+                self.assertEqual(holder, [{"status": "shutting_down"}])
+                store.close()
         finally:
             tg.close()
 
