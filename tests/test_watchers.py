@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from server.agy_runner import AgyResult, AgyRunner
+from server.agy_runner import AgyResult, AgyRunner, build_scrubbed_env
 from server.bot import start_ipc_server
 from server.config import (
     BridgeConfig,
@@ -681,6 +681,68 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(cli_out["recommended_tier"], "rss")
         self.assertEqual(cli_out["alternate_feeds"], [f"{self.srv.base_url}/feed.xml"])
         self.assertNotIn(poison, cli_proc.stdout)
+
+        # 10. CLI invocation `python3 -m server.watchers validate <id>` + NOTIFY_SOCKET scrubbing
+        with tempfile.TemporaryDirectory() as td:
+            mdir = Path(td)
+            good_m = validate_mission(
+                {
+                    "id": "valid-gh",
+                    "title": "Valid GH",
+                    "status": "active",
+                    "kind": "github_releases",
+                    "schedule": {"interval_minutes": 60},
+                    "config": {"repo": "astral-sh/uv"},
+                }
+            )
+            atomic_write_json(mission_path(mdir, "valid-gh"), mdir, good_m)
+            bad_m = {
+                "id": "bad-gh",
+                "title": "Bad GH",
+                "status": "active",
+                "kind": "github_releases",
+                "schedule": {"interval_minutes": 5},
+                "config": {"repo": "not-a-repo"},
+            }
+            atomic_write_json(mission_path(mdir, "bad-gh"), mdir, bad_m)
+
+            v_ok = subprocess.run(
+                [sys.executable, "-m", "server.watchers", "validate", "valid-gh", "--missions-dir", str(mdir)],
+                capture_output=True,
+                text=True,
+                env=cli_env,
+                timeout=10,
+            )
+            self.assertEqual(v_ok.returncode, 0, v_ok.stderr)
+            self.assertTrue(json.loads(v_ok.stdout)["ok"])
+
+            v_bad = subprocess.run(
+                [sys.executable, "-m", "server.watchers", "validate", "bad-gh", "--missions-dir", str(mdir)],
+                capture_output=True,
+                text=True,
+                env=cli_env,
+                timeout=10,
+            )
+            self.assertEqual(v_bad.returncode, 1)
+            self.assertFalse(json.loads(v_bad.stdout)["ok"])
+
+        prev_notify = os.environ.get("NOTIFY_SOCKET")
+        prev_wd = os.environ.get("WATCHDOG_PID")
+        os.environ["NOTIFY_SOCKET"] = "/run/systemd/notify"
+        os.environ["WATCHDOG_PID"] = "12345"
+        try:
+            scrubbed = build_scrubbed_env("agy")
+            self.assertNotIn("NOTIFY_SOCKET", scrubbed)
+            self.assertNotIn("WATCHDOG_PID", scrubbed)
+        finally:
+            if prev_notify is None:
+                os.environ.pop("NOTIFY_SOCKET", None)
+            else:
+                os.environ["NOTIFY_SOCKET"] = prev_notify
+            if prev_wd is None:
+                os.environ.pop("WATCHDOG_PID", None)
+            else:
+                os.environ["WATCHDOG_PID"] = prev_wd
 
 
 class HealthAndRunnerLifecycleTests(unittest.TestCase):

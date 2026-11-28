@@ -24,6 +24,14 @@ from .config import BridgeConfig
 log = logging.getLogger("agy-bridge.runner")
 
 _SENSITIVE_ENV_PREFIXES = ("TELEGRAM_", "BRIDGE_IPC_", "WATCHER_", "AGY_SCOUT_")
+_STRIPPED_ENV_KEYS = frozenset(
+    {
+        "AGY_WATCHER_BRIEFING",
+        "NOTIFY_SOCKET",
+        "WATCHDOG_PID",
+        "WATCHDOG_USEC",
+    }
+)
 _HEADER_SANITIZE_RE = re.compile(r"[\r\n\[\]|]+")
 
 
@@ -96,7 +104,7 @@ def build_scrubbed_env(
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(_SENSITIVE_ENV_PREFIXES) and k != "AGY_WATCHER_BRIEFING"
+        if not k.startswith(_SENSITIVE_ENV_PREFIXES) and k not in _STRIPPED_ENV_KEYS
     }
     bin_path = Path(agy_bin)
     if bin_path.parent != Path("."):
