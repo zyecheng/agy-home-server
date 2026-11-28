@@ -519,6 +519,7 @@ class HealthAndRunnerLifecycleTests(unittest.TestCase):
         deep_nested = ("[x" * 14) + "[Click](https://a.invalid)" + ("](https://evil.example/deep)" * 14)
         raw = (
             "Check [CSMA](https://arts4all.example/piano) and `https://arts4all.example/piano` "
+            "可直接预约（https://arts4all.example/piano）。 "
             "and [x[Click](https://a.invalid)](https://evil.example/nested) "
             "and [Click[](https://[2001:db8::1]/exfil?d=secret) "
             "and [Click[](https://arts4all.example/piano_?leak=secret) "
@@ -532,6 +533,7 @@ class HealthAndRunnerLifecycleTests(unittest.TestCase):
         cleaned = sanitize_stage2_links(raw, allowed)
         self.assertIn("[CSMA](https://arts4all.example/piano)", cleaned)
         self.assertIn("`https://arts4all.example/piano`", cleaned)
+        self.assertIn("可直接预约（https://arts4all.example/piano）。", cleaned)
         self.assertNotIn("evil.example", cleaned)
         self.assertNotIn("2001:db8", cleaned)
         self.assertNotIn("leak=secret", cleaned)
